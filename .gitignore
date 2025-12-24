@@ -1,0 +1,22 @@
+# Python
+backend/.venv/
+backend/.env
+__pycache__/
+*.pyc
+
+# Flutter/Dart
+.dart_tool/
+.buildlog/
+.packages
+pubspec.lock
+**/android/.gradle/
+**/android/local.properties
+**/android/**/GeneratedPluginRegistrant.java
+**/ios/Flutter/Generated.xcconfig
+**/ios/Flutter/flutter_export_environment.sh
+**/ios/Runner/GeneratedPluginRegistrant.*
+
+# IDE/OS
+.DS_Store
+.idea/
+*.iml
