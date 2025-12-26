@@ -1,0 +1,119 @@
+### Health
+GET http://localhost:8000/health
+
+### Create user
+POST http://localhost:8000/users
+Content-Type: application/json
+
+{"email":"alice@example.com"}
+
+### Create relying party
+POST http://localhost:8000/relying-parties
+Content-Type: application/json
+
+{"rp_id":"example.com","display_name":"Example RP"}
+
+### Create device
+POST http://localhost:8000/devices
+Content-Type: application/json
+
+{"user_id":"<USER_ID>","device_label":"Test Phone","platform":"android"}
+
+### Create device key
+POST http://localhost:8000/device-keys
+Content-Type: application/json
+
+{"device_id":"<DEVICE_ID>","rp_id":"<RP_UUID>","key_type":"ed25519","public_key":"BASE64_PUBLIC_KEY"}
+
+### Enrollment (one request)
+POST http://localhost:8000/enroll
+Content-Type: application/json
+
+{
+  "email": "carol@example.com",
+  "device_label": "Research Phone",
+  "platform": "android",
+  "rp_id": "example.com",
+  "rp_display_name": "Example RP",
+  "key_type": "ed25519",
+  "public_key": "BASE64_PUBLIC_KEY"
+}
+
+### Verify (not implemented yet)
+POST http://localhost:8000/verify
+Content-Type: application/json
+
+{
+  "user_id": "<USER_ID>",
+  "device_id": "<DEVICE_ID>",
+  "rp_id": "example.com",
+  "otp": "123456",
+  "device_proof": "BASE64_DEVICE_PROOF"
+}
+
+### TOTP register (server-generated secret)
+POST http://localhost:8000/totp/register
+Content-Type: application/json
+
+{
+  "user_id": "<USER_ID>",
+  "rp_id": "example.com",
+  "account_name": "alice@example.com",
+  "issuer": "Example"
+}
+
+### TOTP verify
+POST http://localhost:8000/totp/verify
+Content-Type: application/json
+
+{
+  "user_id": "<USER_ID>",
+  "rp_id": "example.com",
+  "otp": "123456"
+}
+
+### Recovery code verify (consumes code)
+POST http://localhost:8000/totp/recovery/verify
+Content-Type: application/json
+
+{
+  "user_id": "<USER_ID>",
+  "code": "<RECOVERY_CODE>"
+}
+
+### ZT challenge (nonce)
+POST http://localhost:8000/zt/challenge
+Content-Type: application/json
+
+{
+  "device_id": "<DEVICE_ID>",
+  "rp_id": "example.com"
+}
+
+### ZT verify (signed proof)
+# Signature is Ed25519 over: "<nonce>|<device_id>|<rp_id>|<otp>"
+# public_key is stored during enrollment as base64 raw 32-byte public key.
+POST http://localhost:8000/zt/verify
+Content-Type: application/json
+
+{
+  "user_id": "<USER_ID>",
+  "device_id": "<DEVICE_ID>",
+  "rp_id": "example.com",
+  "otp": "123456",
+  "device_proof": {
+    "nonce": "<NONCE_FROM_CHALLENGE>",
+    "signature": "<BASE64_SIGNATURE>"
+  }
+}
+
+### Rotate device key (public key update)
+POST http://localhost:8000/zt/rotate-key
+Content-Type: application/json
+
+{
+  "device_id": "<DEVICE_ID>",
+  "rp_id": "example.com",
+  "key_type": "p256",
+  "public_key": "<BASE64_PUBLIC_KEY>"
+}

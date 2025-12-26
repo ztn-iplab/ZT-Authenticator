@@ -2,5 +2,6 @@ fastapi
 uvicorn[standard]
 asyncpg
 python-dotenv
+email-validator
 cryptography
 pyotp

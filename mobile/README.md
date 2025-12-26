@@ -1,16 +1,22 @@
-# zt_totp_mobile
+# ZT-Authenticator Mobile
 
-A new Flutter project.
+## Quick start
 
-## Getting Started
+```bash
+cd /Users/patrick-m/Documents/ZT-Authenticator/mobile
+flutter run -d emulator-5554
+```
 
-This project is a starting point for a Flutter application.
+## ZT research flow
 
-A few resources to get you started if this is your first Flutter project:
+1) **ZT Enroll Device**  
+   Generates a device-bound keypair in Android Keystore and registers the public key.
+2) **Register TOTP**  
+   Requests a TOTP secret and saves it locally.
+3) **ZT Verify**  
+   Requests a nonce, signs `<nonce>|<device_id>|<rp_id>|<otp>`, then verifies.
 
-- [Lab: Write your first Flutter app](https://docs.flutter.dev/get-started/codelab)
-- [Cookbook: Useful Flutter samples](https://docs.flutter.dev/cookbook)
+## Notes
 
-For help getting started with Flutter development, view the
-[online documentation](https://docs.flutter.dev/), which offers tutorials,
-samples, guidance on mobile development, and a full API reference.
+- The emulator reaches the backend on `http://10.0.2.2:8000`.
+- Use **Clear local accounts** from the FAB menu to wipe local state.

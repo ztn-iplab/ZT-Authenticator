@@ -1,22 +1,23 @@
-import os
 from typing import Optional
 
 import asyncpg
 
 _pool: Optional[asyncpg.Pool] = None
+_dsn: Optional[str] = None
 
 
-def _database_url() -> str:
-    url = os.getenv("DATABASE_URL")
-    if not url:
-        raise RuntimeError("DATABASE_URL is not set")
-    return url
+def initialize(dsn: str) -> None:
+    global _dsn
+    # Explicit init prevents hidden env lookups in lower layers.
+    _dsn = dsn
 
 
 async def connect() -> asyncpg.Pool:
     global _pool
+    if _dsn is None:
+        raise RuntimeError("Database DSN not initialized")
     if _pool is None:
-        _pool = await asyncpg.create_pool(dsn=_database_url(), min_size=1, max_size=5)
+        _pool = await asyncpg.create_pool(dsn=_dsn, min_size=1, max_size=5)
     return _pool
 
 
