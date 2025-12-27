@@ -1,10 +1,14 @@
 import base64
+import json
+from datetime import datetime, timedelta, timezone
+from io import BytesIO
 from uuid import UUID
 
 import time
 
 from asyncpg import UniqueViolationError
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, Form, HTTPException, Request, Response
+from fastapi.encoders import jsonable_encoder
 
 from app import db
 from app.enrollment import EnrollmentRequest, EnrollmentResponse, enroll
@@ -23,7 +27,20 @@ from app.totp_service import (
     verify_recovery_code,
     verify_totp,
 )
-from app.verification import VerifyRequest, VerifyResponse
+from app.crypto_utils import hash_otp
+from app.verification import (
+    LoginApproveRequest,
+    LoginDenyRequest,
+    LoginPendingResponse,
+    LoginRecoveryRequest,
+    LoginRecoveryResponse,
+    LoginRequest,
+    LoginResponse,
+    LoginStartResponse,
+    LoginStatusResponse,
+    VerifyRequest,
+    VerifyResponse,
+)
 from app.zt_models import (
     ChallengeRequest,
     ChallengeResponse,
@@ -32,12 +49,14 @@ from app.zt_models import (
     ZtVerifyRequest,
     ZtVerifyResponse,
 )
+import qrcode
 from app.zt_service import (
     device_key_exists,
     get_device_key as get_device_key_for_rp,
     issue_challenge,
     verify_device_proof,
 )
+from app.zt_service import generate_nonce
 from app.models import (
     DeviceCreate,
     DeviceKeyCreate,
@@ -48,7 +67,15 @@ from app.models import (
     UserCreate,
     UserOut,
 )
-from app.repositories import challenges, device_keys, devices, relying_parties, totp, users
+from app.repositories import (
+    challenges,
+    device_keys,
+    devices,
+    login_challenges,
+    relying_parties,
+    totp,
+    users,
+)
 import logging
 from time import monotonic
 
@@ -110,6 +137,274 @@ async def enroll_device(payload: EnrollmentRequest) -> EnrollmentResponse:
 async def verify(payload: VerifyRequest) -> VerifyResponse:
     # Placeholder until ZT-TOTP verification is implemented.
     raise HTTPException(status_code=501, detail="verification not implemented yet")
+
+
+@router.post("/login", response_model=LoginStartResponse)
+async def login(payload: LoginRequest, request: Request) -> LoginStartResponse:
+    pool = await db.connect()
+    await login_challenges.prune_expired(pool)
+
+    user = await users.get_by_email(pool, payload.email)
+    if user is None:
+        return LoginStartResponse(status="denied", reason="user_not_found")
+
+    device = await devices.get_latest_for_user(pool, user.id)
+    if device is None:
+        return LoginStartResponse(status="denied", reason="device_not_found")
+
+    secret_row = await totp.get_latest_secret_for_user(pool, user.id)
+    if secret_row is None:
+        return LoginStartResponse(status="denied", reason="totp_not_registered")
+
+    rp_id = secret_row["rp_id"]
+    rp = await relying_parties.get_by_rp_id(pool, rp_id)
+    if rp is None:
+        return LoginStartResponse(status="denied", reason="rp_not_found")
+
+    device_key = await device_keys.get_by_device_and_rp(pool, device.id, rp.id)
+    if device_key is None:
+        return LoginStartResponse(status="denied", reason="device_not_enrolled")
+
+    settings = request.app.state.settings
+    secret = decrypt_secret(secret_row["secret_encrypted"], settings.master_key)
+    if not verify_totp(secret, payload.otp):
+        return LoginStartResponse(status="denied", reason="invalid_otp")
+
+    nonce = generate_nonce()
+    otp_hash = hash_otp(payload.otp, settings.recovery_pepper)
+    expires_at = datetime.now(timezone.utc) + timedelta(seconds=120)
+    challenge = await login_challenges.insert(
+        pool=pool,
+        user_id=user.id,
+        device_id=device.id,
+        rp_id=rp_id,
+        nonce=nonce,
+        otp_hash=otp_hash,
+        expires_at=expires_at,
+    )
+    expires_in = int((challenge["expires_at"] - challenge["created_at"]).total_seconds())
+    return LoginStartResponse(status="pending", login_id=challenge["id"], expires_in=expires_in)
+
+
+@router.get("/login-form")
+async def login_form() -> Response:
+    html = """
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>ZT-TOTP Login</title>
+  <style>
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background:#0f0f0f; color:#f2f2f2; }
+    .card { max-width:420px; margin:8vh auto; background:#1a1a1a; padding:24px; border-radius:16px; box-shadow:0 12px 30px rgba(0,0,0,0.4); }
+    label { display:block; margin:12px 0 6px; }
+    input { width:100%; padding:12px; border-radius:10px; border:1px solid #333; background:#111; color:#f2f2f2; }
+    button { width:100%; margin-top:16px; padding:12px; border:none; border-radius:10px; background:#3b82f6; color:#fff; font-weight:600; }
+    .status { margin-top:12px; color:#b0b0b0; white-space:pre-wrap; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h2>ZT-TOTP Login</h2>
+    <form id="login-form">
+      <label>Email</label>
+      <input type="email" name="email" required />
+      <label>One-Time Password</label>
+      <input type="text" name="otp" inputmode="numeric" />
+      <label>Recovery Code (optional)</label>
+      <input type="text" name="recovery" />
+      <button type="submit">Verify</button>
+    </form>
+    <div class="status" id="status">Ready.</div>
+  </div>
+  <script>
+    const form = document.getElementById('login-form');
+    const status = document.getElementById('status');
+    let pollTimer = null;
+
+    function setStatus(text) {
+      status.textContent = text;
+    }
+
+    async function pollStatus(loginId) {
+      if (pollTimer) clearInterval(pollTimer);
+      pollTimer = setInterval(async () => {
+        const res = await fetch(`/login/status?login_id=${loginId}`);
+        const data = await res.json();
+        if (data.status === 'pending') {
+          setStatus('Pending device approval...');
+          return;
+        }
+        clearInterval(pollTimer);
+        setStatus(JSON.stringify(data));
+      }, 1000);
+    }
+
+    form.addEventListener('submit', async (e) => {
+      e.preventDefault();
+      setStatus('Submitting...');
+      const formData = new FormData(form);
+      const payload = {
+        email: formData.get('email'),
+        otp: formData.get('otp'),
+        recovery_code: formData.get('recovery'),
+      };
+      const res = await fetch('/login-form/submit', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      });
+      const data = await res.json();
+      if (data.status === 'pending' && data.login_id) {
+        setStatus('Pending device approval...');
+        pollStatus(data.login_id);
+        return;
+      }
+      setStatus(JSON.stringify(data));
+    });
+  </script>
+</body>
+</html>
+"""
+    return Response(content=html.strip(), media_type="text/html")
+
+
+@router.post("/login-form/submit")
+async def login_form_submit(payload: dict, request: Request) -> Response:
+    email = (payload.get("email") or "").strip()
+    otp = (payload.get("otp") or "").strip()
+    recovery_code = (payload.get("recovery_code") or "").strip()
+    if not email:
+        return Response(
+            content=json.dumps({"status": "denied", "reason": "missing_fields"}),
+            media_type="application/json",
+            status_code=400,
+        )
+    if recovery_code:
+        recovery = await login_recovery(LoginRecoveryRequest(email=email, recovery_code=recovery_code), request)
+        return Response(content=json.dumps(jsonable_encoder(recovery)), media_type="application/json")
+    if not otp:
+        return Response(
+            content=json.dumps({"status": "denied", "reason": "missing_fields"}),
+            media_type="application/json",
+            status_code=400,
+        )
+
+    start = await login(LoginRequest(email=email, otp=otp), request)
+    return Response(
+        content=json.dumps(jsonable_encoder(start)),
+        media_type="application/json",
+    )
+
+
+@router.get("/login/status", response_model=LoginStatusResponse)
+async def login_status(login_id: UUID) -> LoginStatusResponse:
+    pool = await db.connect()
+    challenge = await login_challenges.get_by_id(pool, login_id)
+    if challenge is None:
+        return LoginStatusResponse(status="denied", reason="not_found")
+    return LoginStatusResponse(status=challenge["status"], reason=challenge["denied_reason"])
+
+
+@router.get("/login/pending", response_model=LoginPendingResponse)
+async def login_pending(user_id: UUID) -> LoginPendingResponse:
+    pool = await db.connect()
+    challenge = await login_challenges.get_pending_for_user(pool, user_id)
+    if challenge is None:
+        return LoginPendingResponse(status="none")
+    expires_in = int((challenge["expires_at"] - challenge["created_at"]).total_seconds())
+    return LoginPendingResponse(
+        status="pending",
+        login_id=challenge["id"],
+        nonce=challenge["nonce"],
+        rp_id=challenge["rp_id"],
+        device_id=challenge["device_id"],
+        expires_in=expires_in,
+    )
+
+
+@router.post("/login/approve", response_model=LoginResponse)
+async def login_approve(payload: LoginApproveRequest, request: Request) -> LoginResponse:
+    pool = await db.connect()
+    challenge = await login_challenges.get_by_id(pool, payload.login_id)
+    if challenge is None or challenge["status"] != "pending":
+        return LoginResponse(status="denied", reason="not_pending")
+    if challenge["device_id"] != payload.device_id or challenge["rp_id"] != payload.rp_id:
+        await login_challenges.mark_denied(pool, payload.login_id, "mismatch")
+        return LoginResponse(status="denied", reason="mismatch")
+
+    rp = await relying_parties.get_by_rp_id(pool, payload.rp_id)
+    if rp is None:
+        await login_challenges.mark_denied(pool, payload.login_id, "rp_not_found")
+        return LoginResponse(status="denied", reason="rp_not_found")
+
+    device_key = await device_keys.get_by_device_and_rp(pool, payload.device_id, rp.id)
+    if device_key is None:
+        await login_challenges.mark_denied(pool, payload.login_id, "device_not_enrolled")
+        return LoginResponse(status="denied", reason="device_not_enrolled")
+
+    secret_row = await totp.get_secret(pool, challenge["user_id"], payload.rp_id)
+    if secret_row is None:
+        await login_challenges.mark_denied(pool, payload.login_id, "totp_not_registered")
+        return LoginResponse(status="denied", reason="totp_not_registered")
+
+    settings = request.app.state.settings
+    secret = decrypt_secret(secret_row["secret_encrypted"], settings.master_key)
+    if not verify_totp(secret, payload.otp):
+        await login_challenges.mark_denied(pool, payload.login_id, "invalid_otp")
+        return LoginResponse(status="denied", reason="invalid_otp")
+
+    expected_hash = hash_otp(payload.otp, settings.recovery_pepper)
+    if challenge["otp_hash"] != expected_hash:
+        await login_challenges.mark_denied(pool, payload.login_id, "otp_mismatch")
+        return LoginResponse(status="denied", reason="otp_mismatch")
+
+    proof_ok = verify_device_proof(
+        key_type=device_key.key_type,
+        public_key=device_key.public_key,
+        nonce=payload.nonce,
+        device_id=payload.device_id,
+        rp_id=payload.rp_id,
+        otp=payload.otp,
+        signature=payload.signature,
+    )
+    if not proof_ok:
+        await login_challenges.mark_denied(pool, payload.login_id, "invalid_device_proof")
+        return LoginResponse(status="denied", reason="invalid_device_proof")
+
+    await login_challenges.mark_approved(pool, payload.login_id)
+    return LoginResponse(status="ok", reason=None)
+
+
+@router.post("/login/deny", response_model=LoginResponse)
+async def login_deny(payload: LoginDenyRequest) -> LoginResponse:
+    pool = await db.connect()
+    challenge = await login_challenges.get_by_id(pool, payload.login_id)
+    if challenge is None:
+        return LoginResponse(status="denied", reason="not_found")
+    if challenge["status"] != "pending":
+        return LoginResponse(status=challenge["status"], reason=challenge["denied_reason"])
+    await login_challenges.mark_denied(pool, payload.login_id, payload.reason)
+    return LoginResponse(status="denied", reason=payload.reason)
+
+
+@router.post("/login/recover", response_model=LoginRecoveryResponse)
+async def login_recovery(payload: LoginRecoveryRequest, request: Request) -> LoginRecoveryResponse:
+    pool = await db.connect()
+    user = await users.get_by_email(pool, payload.email)
+    if user is None:
+        return LoginRecoveryResponse(status="denied", reason="user_not_found")
+    settings = request.app.state.settings
+    ok = await verify_recovery_code(
+        pool=pool,
+        user_id=user.id,
+        code=payload.recovery_code,
+        recovery_pepper=settings.recovery_pepper,
+    )
+    if not ok:
+        return LoginRecoveryResponse(status="denied", reason="invalid_recovery_code")
+    return LoginRecoveryResponse(status="ok", reason=None)
 
 
 @router.post("/zt/challenge", response_model=ChallengeResponse)
@@ -302,6 +597,104 @@ async def zt_rotate_key(payload: DeviceKeyRotateRequest) -> DeviceKeyRotateRespo
     )
     logger.info("zt_rotate_key ok device_id=%s rp_id=%s", payload.device_id, payload.rp_id)
     return DeviceKeyRotateResponse(status="ok", reason=None)
+
+
+@router.get("/enroll/qr")
+async def enroll_qr(
+    rp_id: str,
+    email: str,
+    issuer: str,
+    account_name: str,
+    rp_display_name: str | None = None,
+    device_label: str | None = None,
+) -> Response:
+    payload = {
+        "type": "zt_totp_enroll",
+        "rp_id": rp_id,
+        "rp_display_name": rp_display_name or rp_id,
+        "email": email,
+        "issuer": issuer,
+        "account_name": account_name,
+        "device_label": device_label or "Research Phone",
+    }
+    payload_json = json.dumps(payload, separators=(",", ":"))
+    qr = qrcode.QRCode(
+        version=3,
+        error_correction=qrcode.constants.ERROR_CORRECT_M,
+        box_size=8,
+        border=2,
+    )
+    qr.add_data(payload_json)
+    qr.make(fit=True)
+    img = qr.make_image(fill_color="black", back_color="white")
+    buffer = BytesIO()
+    img.save(buffer, format="PNG")
+    return Response(content=buffer.getvalue(), media_type="image/png")
+
+
+@router.get("/enroll/qr-page")
+async def enroll_qr_page(
+    rp_id: str,
+    email: str,
+    issuer: str,
+    account_name: str,
+    rp_display_name: str | None = None,
+    device_label: str | None = None,
+) -> Response:
+    params = {
+        "rp_id": rp_id,
+        "email": email,
+        "issuer": issuer,
+        "account_name": account_name,
+        "rp_display_name": rp_display_name or rp_id,
+        "device_label": device_label or "Research Phone",
+    }
+    query = "&".join(f"{key}={value}" for key, value in params.items())
+    html = f"""
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>ZT-TOTP Enrollment QR</title>
+  <style>
+    body {{
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      background: #0f0f0f;
+      color: #f2f2f2;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      min-height: 100vh;
+      margin: 0;
+    }}
+    .card {{
+      background: #1a1a1a;
+      padding: 32px;
+      border-radius: 16px;
+      text-align: center;
+      box-shadow: 0 12px 30px rgba(0,0,0,0.4);
+    }}
+    img {{
+      width: 320px;
+      height: 320px;
+      border-radius: 12px;
+      background: #fff;
+      padding: 8px;
+    }}
+    p {{ margin-top: 16px; color: #b0b0b0; }}
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h2>ZT-TOTP Enrollment</h2>
+    <img src="/enroll/qr?{query}" alt="Enrollment QR" />
+    <p>Scan this QR with ZT-Authenticator</p>
+  </div>
+</body>
+</html>
+"""
+    return Response(content=html.strip(), media_type="text/html")
 
 
 @router.get("/totp/debug-code")

@@ -72,6 +72,55 @@ Content-Type: application/json
   "otp": "123456"
 }
 
+### Classic login (email + otp + rp_id + device_id)
+POST http://localhost:8000/login
+Content-Type: application/json
+
+{
+  "email": "alice@example.com",
+  "otp": "123456"
+}
+
+### Login form page
+GET http://localhost:8000/login-form
+
+### Login status (poll from web client)
+GET http://localhost:8000/login/status?login_id=<LOGIN_ID>
+
+### Login pending (device polls)
+GET http://localhost:8000/login/pending?user_id=<USER_ID>
+
+### Login approve (device proof)
+POST http://localhost:8000/login/approve
+Content-Type: application/json
+
+{
+  "login_id": "<LOGIN_ID>",
+  "device_id": "<DEVICE_ID>",
+  "rp_id": "example.com",
+  "otp": "123456",
+  "nonce": "<NONCE>",
+  "signature": "<DEVICE_SIGNATURE>"
+}
+
+### Login recovery (fallback)
+POST http://localhost:8000/login/recover
+Content-Type: application/json
+
+{
+  "email": "alice@example.com",
+  "recovery_code": "<RECOVERY_CODE>"
+}
+
+### Login deny (explicit device rejection)
+POST http://localhost:8000/login/deny
+Content-Type: application/json
+
+{
+  "login_id": "<LOGIN_ID>",
+  "reason": "user_denied"
+}
+
 ### Recovery code verify (consumes code)
 POST http://localhost:8000/totp/recovery/verify
 Content-Type: application/json
@@ -117,3 +166,9 @@ Content-Type: application/json
   "key_type": "p256",
   "public_key": "<BASE64_PUBLIC_KEY>"
 }
+
+### Enrollment QR (PNG)
+GET http://localhost:8000/enroll/qr?rp_id=example.com&email=alice@example.com&issuer=Example&account_name=alice@example.com&rp_display_name=Example%20RP&device_label=Research%20Phone
+
+### Enrollment QR page (HTML)
+GET http://localhost:8000/enroll/qr-page?rp_id=example.com&email=alice@example.com&issuer=Example&account_name=alice@example.com&rp_display_name=Example%20RP&device_label=Research%20Phone

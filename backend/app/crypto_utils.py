@@ -18,6 +18,11 @@ def hash_recovery_code(code: str, pepper: str) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
+def hash_otp(code: str, pepper: str) -> str:
+    data = (code + pepper).encode("utf-8")
+    return hashlib.sha256(data).hexdigest()
+
+
 def generate_master_key() -> str:
     return Fernet.generate_key().decode("utf-8")
 

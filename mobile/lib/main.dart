@@ -9,7 +9,7 @@ import 'totp.dart';
 import 'totp_store.dart';
 
 // Android emulator reaches host localhost via 10.0.2.2.
-const String apiBaseUrl = 'http://10.0.2.2:8000';
+const String apiBaseUrl = 'http://192.168.60.2:8000';
 
 void main() {
   runApp(const ZtAuthenticatorApp());
@@ -62,16 +62,24 @@ class _HomeScreenState extends State<HomeScreen> {
   final TotpStore _store = TotpStore();
   final List<TotpAccount> _totpAccounts = [];
   Timer? _ticker;
+  Timer? _loginPoller;
+  final DeviceCrypto _deviceCrypto = DeviceCrypto();
+  bool _approvalDialogOpen = false;
+  String _lastLoginId = '';
 
   @override
   void initState() {
     super.initState();
     _apiClient = ApiClient(baseUrl: apiBaseUrl);
+    print('API base URL: $apiBaseUrl');
     _loadAccounts();
     _ticker = Timer.periodic(const Duration(seconds: 1), (_) {
       if (mounted) {
         setState(() {});
       }
+    });
+    _loginPoller = Timer.periodic(const Duration(seconds: 5), (_) {
+      _pollLoginApprovals();
     });
   }
 
@@ -87,6 +95,7 @@ class _HomeScreenState extends State<HomeScreen> {
   @override
   void dispose() {
     _ticker?.cancel();
+    _loginPoller?.cancel();
     _apiClient.close();
     super.dispose();
   }
@@ -95,6 +104,109 @@ class _HomeScreenState extends State<HomeScreen> {
     setState(() {
       _totpAccounts.add(account);
     });
+  }
+
+  Future<void> _pollLoginApprovals() async {
+    if (_totpAccounts.isEmpty) {
+      return;
+    }
+    for (final account in _totpAccounts) {
+      if (account.userId.isEmpty || account.rpId.isEmpty || account.deviceId.isEmpty) {
+        continue;
+      }
+      try {
+        final response = await _apiClient.get('/login/pending?user_id=${account.userId}');
+        if (response.statusCode != 200) {
+          continue;
+        }
+        final data = jsonDecode(response.body) as Map<String, dynamic>;
+        if (data['status'] != 'pending') {
+          continue;
+        }
+        final pendingRp = data['rp_id'] as String? ?? '';
+        final pendingDevice = data['device_id'] as String? ?? '';
+        final loginId = data['login_id'] as String? ?? '';
+        final nonce = data['nonce'] as String? ?? '';
+        if (pendingRp != account.rpId ||
+            pendingDevice != account.deviceId ||
+            loginId.isEmpty ||
+            nonce.isEmpty) {
+          continue;
+        }
+        if (_approvalDialogOpen || loginId == _lastLoginId) {
+          continue;
+        }
+        _lastLoginId = loginId;
+        if (!mounted) {
+          return;
+        }
+        _approvalDialogOpen = true;
+        await _showApprovalDialog(
+          account: account,
+          loginId: loginId,
+          nonce: nonce,
+        );
+        _approvalDialogOpen = false;
+      } catch (_) {
+        continue;
+      }
+    }
+  }
+
+  Future<void> _showApprovalDialog({
+    required TotpAccount account,
+    required String loginId,
+    required String nonce,
+  }) async {
+    await showDialog<void>(
+      context: context,
+      barrierDismissible: false,
+      builder: (context) {
+        return AlertDialog(
+          title: const Text('Approve login?'),
+          content: Text('Account: ${account.account}\nRP: ${account.rpId}'),
+          actions: [
+            TextButton(
+              onPressed: () async {
+                await _apiClient.postJson('/login/deny', {
+                  'login_id': loginId,
+                  'reason': 'user_denied',
+                });
+                if (mounted) {
+                  Navigator.of(context).pop();
+                }
+              },
+              child: const Text('Deny'),
+            ),
+            ElevatedButton(
+              onPressed: () async {
+                final otp = account.currentCode();
+                final signature = await _deviceCrypto.sign(
+                  rpId: account.rpId,
+                  nonce: nonce,
+                  deviceId: account.deviceId,
+                  otp: otp,
+                );
+                if (signature.isNotEmpty) {
+                  await _apiClient.postJson('/login/approve', {
+                    'login_id': loginId,
+                    'device_id': account.deviceId,
+                    'rp_id': account.rpId,
+                    'otp': otp,
+                    'nonce': nonce,
+                    'signature': signature,
+                  });
+                }
+                if (mounted) {
+                  Navigator.of(context).pop();
+                }
+              },
+              child: const Text('Approve'),
+            ),
+          ],
+        );
+      },
+    );
   }
 
   void _openActions() {
@@ -152,6 +264,22 @@ class _HomeScreenState extends State<HomeScreen> {
                       builder: (_) => ZtVerifyScreen(
                         apiClient: _apiClient,
                         accounts: List<TotpAccount>.from(_totpAccounts),
+                      ),
+                    ),
+                  );
+                },
+              ),
+              _SheetAction(
+                icon: Icons.approval_outlined,
+                label: 'Login approvals',
+                onTap: () {
+                  Navigator.of(context).pop();
+                  Navigator.of(context).push(
+                    MaterialPageRoute(
+                      builder: (_) => LoginApprovalsScreen(
+                        apiClient: _apiClient,
+                        accounts: List<TotpAccount>.from(_totpAccounts),
+                        deviceCrypto: _deviceCrypto,
                       ),
                     ),
                   );
@@ -470,124 +598,19 @@ class TotpSetupScreen extends StatefulWidget {
 class _TotpSetupScreenState extends State<TotpSetupScreen> {
   final TotpStore _store = TotpStore();
   final DeviceCrypto _deviceCrypto = DeviceCrypto();
-  final _emailController = TextEditingController(text: 'alice@example.com');
-  final _userIdController =
-      TextEditingController(text: '00000000-0000-0000-0000-000000000000');
-  final _rpIdController = TextEditingController(text: 'example.com');
-  final _rpDisplayNameController = TextEditingController(text: 'Example RP');
-  final _deviceLabelController = TextEditingController(text: 'Research Phone');
-  final _deviceIdController = TextEditingController();
-  final _accountController = TextEditingController(text: 'alice@example.com');
-  final _issuerController = TextEditingController(text: 'Example');
   String _status = '';
   List<String> _recoveryCodes = [];
   bool _loading = false;
+  String _lastEmail = '';
+  String _lastRpId = '';
+  String _lastIssuer = '';
+  String _lastAccount = '';
+  String _lastUserId = '';
+  String _lastDeviceId = '';
 
   @override
   void dispose() {
-    _emailController.dispose();
-    _userIdController.dispose();
-    _rpIdController.dispose();
-    _rpDisplayNameController.dispose();
-    _deviceLabelController.dispose();
-    _deviceIdController.dispose();
-    _accountController.dispose();
-    _issuerController.dispose();
     super.dispose();
-  }
-
-  Future<void> _createUser() async {
-    setState(() {
-      _loading = true;
-      _status = '';
-    });
-
-    final payload = {'email': _emailController.text.trim()};
-
-    try {
-      final response = await widget.apiClient.postJson('/users', payload);
-      if (response.statusCode == 200) {
-        final data = jsonDecode(response.body) as Map<String, dynamic>;
-        setState(() {
-          _userIdController.text = data['id'] as String;
-          _accountController.text = data['email'] as String;
-          _status = 'User created.';
-        });
-      } else {
-        setState(() {
-          _status = 'Create user failed: ${response.body}';
-        });
-      }
-    } catch (error) {
-      setState(() {
-        _status = 'Error: $error';
-      });
-    } finally {
-      if (mounted) {
-        setState(() {
-          _loading = false;
-        });
-      }
-    }
-  }
-
-  Future<void> _register() async {
-    setState(() {
-      _loading = true;
-      _status = '';
-    });
-
-    final payload = {
-      'user_id': _userIdController.text.trim(),
-      'rp_id': _rpIdController.text.trim(),
-      'account_name': _accountController.text.trim(),
-      'issuer': _issuerController.text.trim(),
-    };
-
-    try {
-      final response = await widget.apiClient.postJson(
-        '/totp/register',
-        payload,
-      );
-      setState(() {
-        _status = 'Status: ${response.statusCode}';
-      });
-      if (response.statusCode == 200) {
-      final data = jsonDecode(response.body) as Map<String, dynamic>;
-      setState(() {
-        _recoveryCodes =
-            (data['recovery_codes'] as List<dynamic>).cast<String>();
-      });
-      if (data['otpauth_uri'] != null) {
-          final uri = Uri.parse(data['otpauth_uri'] as String);
-          final secret = uri.queryParameters['secret'] ?? '';
-          final issuer = uri.queryParameters['issuer'] ?? _issuerController.text;
-          final label = uri.pathSegments.isNotEmpty ? uri.pathSegments.first : '';
-          if (secret.isNotEmpty) {
-            final record = TotpRecord(
-              issuer: issuer,
-              account: label,
-              secret: secret,
-              userId: _userIdController.text.trim(),
-              rpId: _rpIdController.text.trim(),
-              deviceId: _deviceIdController.text.trim(),
-            );
-            await _store.save(record);
-            widget.onRegistered(TotpAccount.fromRecord(record));
-          }
-        }
-      }
-    } catch (error) {
-      setState(() {
-        _status = 'Error: $error';
-      });
-    } finally {
-      if (mounted) {
-        setState(() {
-          _loading = false;
-        });
-      }
-    }
   }
 
   Future<void> _scanQr() async {
@@ -598,51 +621,44 @@ class _TotpSetupScreenState extends State<TotpSetupScreen> {
       return;
     }
 
-    final uri = Uri.tryParse(result);
-    if (uri == null || uri.scheme != 'otpauth') {
+    Map<String, dynamic> payload;
+    try {
+      payload = jsonDecode(result) as Map<String, dynamic>;
+    } catch (_) {
       setState(() {
-        _status = 'Scanned QR is not an otpauth URI.';
+        _status = 'Scanned QR is not a valid enrollment payload.';
       });
       return;
     }
 
-    final label = uri.pathSegments.isNotEmpty ? uri.pathSegments.first : '';
-    final issuer = uri.queryParameters['issuer'] ?? '';
-    final secret = uri.queryParameters['secret'] ?? '';
-
-    setState(() {
-      _accountController.text = label;
-      _issuerController.text = issuer;
-      _status = 'QR scanned. Ready to register.';
-    });
-
-    if (secret.isNotEmpty) {
-      final record = TotpRecord(
-        issuer: issuer,
-        account: label,
-        secret: secret,
-        userId: _userIdController.text.trim(),
-        rpId: _rpIdController.text.trim(),
-        deviceId: _deviceIdController.text.trim(),
-      );
-      await _store.save(record);
-      widget.onRegistered(TotpAccount.fromRecord(record));
-    }
-  }
-
-  Future<void> _ztEnroll() async {
-    final email = _emailController.text.trim();
-    final rpId = _rpIdController.text.trim();
-    if (email.isEmpty || rpId.isEmpty) {
+    if (payload['type'] != 'zt_totp_enroll') {
       setState(() {
-        _status = 'Email and RP ID are required for ZT enrollment.';
+        _status = 'Enrollment QR type not recognized.';
+      });
+      return;
+    }
+
+    final email = (payload['email'] as String?)?.trim() ?? '';
+    final rpId = (payload['rp_id'] as String?)?.trim() ?? '';
+    final rpDisplayName =
+        (payload['rp_display_name'] as String?)?.trim() ?? rpId;
+    final issuer = (payload['issuer'] as String?)?.trim() ?? '';
+    final accountName = (payload['account_name'] as String?)?.trim() ?? '';
+    final deviceLabel =
+        (payload['device_label'] as String?)?.trim() ?? 'Android Device';
+    if (email.isEmpty ||
+        rpId.isEmpty ||
+        issuer.isEmpty ||
+        accountName.isEmpty) {
+      setState(() {
+        _status = 'Enrollment QR is missing required fields.';
       });
       return;
     }
 
     setState(() {
       _loading = true;
-      _status = '';
+      _status = 'Enrolling device...';
     });
 
     try {
@@ -653,33 +669,79 @@ class _TotpSetupScreenState extends State<TotpSetupScreen> {
         });
         return;
       }
-      final payload = {
+      final enrollPayload = {
         'email': email,
-        'device_label': _deviceLabelController.text.trim().isEmpty
-            ? 'Android Device'
-            : _deviceLabelController.text.trim(),
+        'device_label': deviceLabel,
         'platform': 'android',
         'rp_id': rpId,
-        'rp_display_name': _rpDisplayNameController.text.trim().isEmpty
-            ? rpId
-            : _rpDisplayNameController.text.trim(),
+        'rp_display_name': rpDisplayName,
         'key_type': 'p256',
         'public_key': publicKey,
       };
-      final response = await widget.apiClient.postJson('/enroll', payload);
-      if (response.statusCode == 200) {
-        final data = jsonDecode(response.body) as Map<String, dynamic>;
+      final enrollResponse = await widget.apiClient.postJson(
+        '/enroll',
+        enrollPayload,
+      );
+      if (enrollResponse.statusCode != 200) {
         setState(() {
-          _userIdController.text = data['user']['id'] as String;
-          _deviceIdController.text = data['device']['id'] as String;
-          _accountController.text = data['user']['email'] as String;
-          _status = 'ZT enrollment complete.';
+          _status = 'Enrollment failed: ${enrollResponse.body}';
         });
-      } else {
-        setState(() {
-          _status = 'Enrollment failed: ${response.body}';
-        });
+        return;
       }
+
+      final enrollData = jsonDecode(enrollResponse.body) as Map<String, dynamic>;
+      final userId = enrollData['user']['id'] as String;
+      final deviceId = enrollData['device']['id'] as String;
+      setState(() {
+        _lastEmail = email;
+        _lastRpId = rpId;
+        _lastIssuer = issuer;
+        _lastAccount = accountName;
+        _lastUserId = userId;
+        _lastDeviceId = deviceId;
+        _status = 'Registering TOTP...';
+      });
+
+      final totpResponse = await widget.apiClient.postJson(
+        '/totp/register',
+        {
+          'user_id': userId,
+          'rp_id': rpId,
+          'account_name': accountName,
+          'issuer': issuer,
+        },
+      );
+      if (totpResponse.statusCode != 200) {
+        setState(() {
+          _status = 'TOTP registration failed: ${totpResponse.body}';
+        });
+        return;
+      }
+      final totpData = jsonDecode(totpResponse.body) as Map<String, dynamic>;
+      setState(() {
+        _recoveryCodes =
+            (totpData['recovery_codes'] as List<dynamic>).cast<String>();
+      });
+      if (totpData['otpauth_uri'] != null) {
+        final uri = Uri.parse(totpData['otpauth_uri'] as String);
+        final secret = uri.queryParameters['secret'] ?? '';
+        final label = uri.pathSegments.isNotEmpty ? uri.pathSegments.first : '';
+        if (secret.isNotEmpty) {
+          final record = TotpRecord(
+            issuer: issuer,
+            account: label.isEmpty ? accountName : label,
+            secret: secret,
+            userId: userId,
+            rpId: rpId,
+            deviceId: deviceId,
+          );
+          await _store.save(record);
+          widget.onRegistered(TotpAccount.fromRecord(record));
+        }
+      }
+      setState(() {
+        _status = 'Enrollment complete.';
+      });
     } catch (error) {
       setState(() {
         _status = 'Error: $error';
@@ -701,53 +763,35 @@ class _TotpSetupScreenState extends State<TotpSetupScreen> {
         padding: const EdgeInsets.all(16),
         children: [
           const _SectionHeader(
-            title: 'ZT Enrollment',
-            subtitle: 'Generate a device keypair and enroll with the server.',
+            title: 'Enrollment QR',
+            subtitle: 'Scan a single QR to enroll and register TOTP.',
           ),
           const SizedBox(height: 16),
-          _Field(label: 'Email', controller: _emailController),
-          _Field(label: 'RP ID', controller: _rpIdController),
-          _Field(label: 'RP Display Name', controller: _rpDisplayNameController),
-          _Field(label: 'Device Label', controller: _deviceLabelController),
-          const SizedBox(height: 8),
           ElevatedButton(
-            onPressed: _loading ? null : _ztEnroll,
-            child: Text(_loading ? 'Enrolling...' : 'ZT Enroll Device'),
-          ),
-          const SizedBox(height: 8),
-          ElevatedButton(
-            onPressed: _loading ? null : _createUser,
-            child: const Text('Create User'),
-          ),
-          const SizedBox(height: 16),
-          _Field(label: 'User ID', controller: _userIdController),
-          _Field(label: 'Device ID', controller: _deviceIdController),
-          _Field(label: 'Account Name', controller: _accountController),
-          _Field(label: 'Issuer', controller: _issuerController),
-          const SizedBox(height: 12),
-          const _SectionHeader(
-            title: 'TOTP Registration',
-            subtitle: 'Scan a QR or register from the server.',
+            onPressed: _loading ? null : _scanQr,
+            child: Text(_loading ? 'Working...' : 'Scan Enrollment QR'),
           ),
           const SizedBox(height: 12),
-          Row(
-            children: [
-              Expanded(
-                child: ElevatedButton.icon(
-                  onPressed: _scanQr,
-                  icon: const Icon(Icons.qr_code_scanner),
-                  label: const Text('Scan QR'),
-                ),
-              ),
-              const SizedBox(width: 12),
-              Expanded(
-                child: ElevatedButton(
-                  onPressed: _loading ? null : _register,
-                  child: Text(_loading ? 'Registering...' : 'Register TOTP'),
-                ),
-              ),
-            ],
-          ),
+          if (_lastUserId.isNotEmpty || _lastDeviceId.isNotEmpty) ...[
+            const _SectionHeader(
+              title: 'Enrollment Summary',
+              subtitle: 'Stored locally for verification.',
+            ),
+            const SizedBox(height: 8),
+            Text('Email: $_lastEmail',
+                style: const TextStyle(color: Colors.white70)),
+            Text('RP ID: $_lastRpId',
+                style: const TextStyle(color: Colors.white70)),
+            Text('Account: $_lastAccount',
+                style: const TextStyle(color: Colors.white70)),
+            Text('Issuer: $_lastIssuer',
+                style: const TextStyle(color: Colors.white70)),
+            Text('User ID: $_lastUserId',
+                style: const TextStyle(color: Colors.white70)),
+            Text('Device ID: $_lastDeviceId',
+                style: const TextStyle(color: Colors.white70)),
+            const SizedBox(height: 12),
+          ],
           const SizedBox(height: 12),
           Text(_status, style: const TextStyle(color: Colors.white70)),
           if (_recoveryCodes.isNotEmpty) ...[
@@ -1112,6 +1156,231 @@ class _ZtVerifyScreenState extends State<ZtVerifyScreen> {
           ),
           const SizedBox(height: 16),
           Text(_status, style: const TextStyle(color: Colors.white70)),
+        ],
+      ),
+    );
+  }
+}
+
+class LoginApprovalsScreen extends StatefulWidget {
+  const LoginApprovalsScreen({
+    super.key,
+    required this.apiClient,
+    required this.accounts,
+    required this.deviceCrypto,
+  });
+
+  final ApiClient apiClient;
+  final List<TotpAccount> accounts;
+  final DeviceCrypto deviceCrypto;
+
+  @override
+  State<LoginApprovalsScreen> createState() => _LoginApprovalsScreenState();
+}
+
+class _LoginApprovalsScreenState extends State<LoginApprovalsScreen> {
+  String _status = '';
+  bool _loading = false;
+  Map<String, dynamic>? _pending;
+
+  @override
+  void initState() {
+    super.initState();
+    _refresh();
+  }
+
+  TotpAccount? _matchAccount(Map<String, dynamic> pending) {
+    final rpId = pending['rp_id'] as String? ?? '';
+    final deviceId = pending['device_id'] as String? ?? '';
+    for (final account in widget.accounts) {
+      if (account.rpId == rpId && account.deviceId == deviceId) {
+        return account;
+      }
+    }
+    return null;
+  }
+
+  Future<void> _refresh() async {
+    setState(() {
+      _loading = true;
+      _status = '';
+    });
+    try {
+      for (final account in widget.accounts) {
+        if (account.userId.isEmpty) {
+          continue;
+        }
+        final response = await widget.apiClient.get(
+          '/login/pending?user_id=${account.userId}',
+        );
+        if (response.statusCode != 200) {
+          continue;
+        }
+        final data = jsonDecode(response.body) as Map<String, dynamic>;
+        if (data['status'] == 'pending') {
+          setState(() {
+            _pending = data;
+          });
+          return;
+        }
+      }
+      setState(() {
+        _pending = null;
+        _status = 'No pending logins.';
+      });
+    } catch (error) {
+      setState(() {
+        _status = 'Error: $error';
+      });
+    } finally {
+      if (mounted) {
+        setState(() {
+          _loading = false;
+        });
+      }
+    }
+  }
+
+  Future<void> _approve() async {
+    final pending = _pending;
+    if (pending == null) {
+      return;
+    }
+    final account = _matchAccount(pending);
+    if (account == null) {
+      setState(() {
+        _status = 'No matching account for this login.';
+      });
+      return;
+    }
+    final loginId = pending['login_id'] as String? ?? '';
+    final nonce = pending['nonce'] as String? ?? '';
+    if (loginId.isEmpty || nonce.isEmpty) {
+      setState(() {
+        _status = 'Pending login is missing data.';
+      });
+      return;
+    }
+    setState(() {
+      _loading = true;
+      _status = '';
+    });
+    try {
+      final otp = account.currentCode();
+      final signature = await widget.deviceCrypto.sign(
+        rpId: account.rpId,
+        nonce: nonce,
+        deviceId: account.deviceId,
+        otp: otp,
+      );
+      final response = await widget.apiClient.postJson('/login/approve', {
+        'login_id': loginId,
+        'device_id': account.deviceId,
+        'rp_id': account.rpId,
+        'otp': otp,
+        'nonce': nonce,
+        'signature': signature,
+      });
+      setState(() {
+        _status = 'Approve: ${response.statusCode} ${response.body}';
+      });
+      await _refresh();
+    } catch (error) {
+      setState(() {
+        _status = 'Error: $error';
+      });
+    } finally {
+      if (mounted) {
+        setState(() {
+          _loading = false;
+        });
+      }
+    }
+  }
+
+  Future<void> _deny() async {
+    final pending = _pending;
+    if (pending == null) {
+      return;
+    }
+    final loginId = pending['login_id'] as String? ?? '';
+    if (loginId.isEmpty) {
+      return;
+    }
+    setState(() {
+      _loading = true;
+      _status = '';
+    });
+    try {
+      final response = await widget.apiClient.postJson('/login/deny', {
+        'login_id': loginId,
+        'reason': 'user_denied',
+      });
+      setState(() {
+        _status = 'Denied: ${response.statusCode} ${response.body}';
+      });
+      await _refresh();
+    } catch (error) {
+      setState(() {
+        _status = 'Error: $error';
+      });
+    } finally {
+      if (mounted) {
+        setState(() {
+          _loading = false;
+        });
+      }
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final pending = _pending;
+    return Scaffold(
+      appBar: AppBar(title: const Text('Login approvals')),
+      body: ListView(
+        padding: const EdgeInsets.all(16),
+        children: [
+          const _SectionHeader(
+            title: 'Pending login',
+            subtitle: 'Approve or deny login requests.',
+          ),
+          const SizedBox(height: 16),
+          if (pending == null)
+            Text(_status, style: const TextStyle(color: Colors.white70)),
+          if (pending != null) ...[
+            Text('Login ID: ${pending['login_id']}',
+                style: const TextStyle(color: Colors.white70)),
+            Text('RP ID: ${pending['rp_id']}',
+                style: const TextStyle(color: Colors.white70)),
+            Text('Device ID: ${pending['device_id']}',
+                style: const TextStyle(color: Colors.white70)),
+            const SizedBox(height: 16),
+            Row(
+              children: [
+                Expanded(
+                  child: ElevatedButton(
+                    onPressed: _loading ? null : _deny,
+                    child: const Text('Deny'),
+                  ),
+                ),
+                const SizedBox(width: 12),
+                Expanded(
+                  child: ElevatedButton(
+                    onPressed: _loading ? null : _approve,
+                    child: const Text('Approve'),
+                  ),
+                ),
+              ],
+            ),
+            const SizedBox(height: 12),
+            Text(_status, style: const TextStyle(color: Colors.white70)),
+          ],
+          const SizedBox(height: 16),
+          ElevatedButton(
+            onPressed: _loading ? null : _refresh,
+            child: const Text('Refresh'),
+          ),
         ],
       ),
     );

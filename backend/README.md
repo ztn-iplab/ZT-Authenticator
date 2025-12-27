@@ -52,6 +52,77 @@ For Android Keystore we currently recommend P-256 (secp256r1) keys with
 4) **Sign proof**: device signs `<nonce>|<device_id>|<rp_id>|<otp>`.
 5) **Verify**: server validates OTP + nonce + signature at `/zt/verify`.
 
+## Classic login flow (email + OTP + RP + device)
+
+Use `POST /login` with:
+- `email`
+- `otp`
+
+The server creates a pending login challenge. The device approves it in the
+background using a device-bound signature.
+
+## Classic login form (web)
+
+Open `http://<host>:8000/login-form` and submit only email + OTP.
+The server derives the RP and device from the latest enrollment for that user.
+The ZT-Authenticator app silently approves the login in the background.
+
+If the device is offline, use a recovery code in the same form. Recovery codes
+are one-time use and bypass the device approval step.
+
+## Security design notes (academic detail)
+
+### Compatibility with existing authenticators
+- **TOTP generation remains offline and unchanged.** The OTP is still derived
+  from the shared seed and time, exactly as in standard authenticators.
+- The **Zero Trust layer** is added only at **verification time**, by requiring
+  a device-bound signature over the server nonce.
+
+### Cryptographic material
+- **TOTP seed**: shared secret between server and device; stored encrypted server-side.
+- **Device keypair**: generated and stored on-device in the Android Keystore.
+  - **Private key** is non-exportable and used only for signing.
+  - **Public key** is registered server-side and bound to `(device_id, rp_id)`.
+
+### Protocol (ZT-TOTP proof)
+Let `K_priv` be the device private key and `K_pub` the enrolled public key.
+
+1) Server issues a fresh **nonce** `n` with expiration `t_exp`.
+2) Device computes the current OTP `otp` and signs:
+   ```
+   m = n || "|" || device_id || "|" || rp_id || "|" || otp
+   σ = Sign(K_priv, m)
+   ```
+3) Device sends `{otp, n, σ}` to the server.
+4) Server verifies:
+   - `otp` is valid for the stored seed (within time window).
+   - `n` exists, is unexpired, and unused.
+   - `Verify(K_pub, m, σ)` succeeds.
+
+### Security properties
+- **Seed compromise resilience**: A stolen seed yields valid OTPs, but **cannot**
+  produce a valid signature without the device private key.
+- **Relay phishing mitigation**: A relayed OTP is insufficient without a
+  device-bound signature over the nonce and RP identifier.
+- **Device binding**: Login success implies possession of the enrolled device key.
+
+### Classic login with hidden device proof
+The web form accepts only `email + OTP`, but the server creates a pending
+challenge. The enrolled device must approve by signing the nonce. Without
+device approval, logins remain pending and expire.
+
+### Recovery codes
+Recovery codes are one-time tokens bound to the user, intended for offline
+fallback when the device is unavailable. They bypass device proof by design
+and should be treated as high-value secrets.
+
+### Role of the RP (relying party)
+- The **RP identifier** is included in the signed message so a proof is bound
+  to the intended relying party.
+- This prevents a proof generated for one RP from being replayed against another.
+- The RP identifier is stored server-side and linked to device keys, enforcing
+  device enrollment per RP.
+
 ## Key rotation (device-bound keys)
 
 Use `/zt/rotate-key` to rotate the public key when a device is re-imaged or a key is refreshed.

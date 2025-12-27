@@ -53,6 +53,25 @@ async def get_secret(
     return _row_to_secret(row)
 
 
+async def get_latest_secret_for_user(
+    pool: asyncpg.Pool,
+    user_id: UUID,
+) -> dict | None:
+    row = await pool.fetchrow(
+        """
+        SELECT id, user_id, rp_id, secret_encrypted, created_at
+        FROM totp_secrets
+        WHERE user_id = $1
+        ORDER BY created_at DESC
+        LIMIT 1
+        """,
+        user_id,
+    )
+    if row is None:
+        return None
+    return _row_to_secret(row)
+
+
 async def insert_recovery_code(
     pool: asyncpg.Pool,
     user_id: UUID,

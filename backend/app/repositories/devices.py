@@ -43,3 +43,19 @@ async def get_by_id(pool: asyncpg.Pool, device_id: UUID) -> DeviceOut | None:
     if row is None:
         return None
     return _row_to_device(row)
+
+
+async def get_latest_for_user(pool: asyncpg.Pool, user_id: UUID) -> DeviceOut | None:
+    row = await pool.fetchrow(
+        """
+        SELECT id, user_id, device_label, platform, created_at
+        FROM devices
+        WHERE user_id = $1
+        ORDER BY created_at DESC
+        LIMIT 1
+        """,
+        user_id,
+    )
+    if row is None:
+        return None
+    return _row_to_device(row)
