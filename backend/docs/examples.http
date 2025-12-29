@@ -1,32 +1,32 @@
 ### Health
-GET http://localhost:8000/health
+GET https://localhost:8000/health
 
 ### Create user
-POST http://localhost:8000/users
+POST https://localhost:8000/users
 Content-Type: application/json
 
 {"email":"alice@example.com"}
 
 ### Create relying party
-POST http://localhost:8000/relying-parties
+POST https://localhost:8000/relying-parties
 Content-Type: application/json
 
 {"rp_id":"example.com","display_name":"Example RP"}
 
 ### Create device
-POST http://localhost:8000/devices
+POST https://localhost:8000/devices
 Content-Type: application/json
 
 {"user_id":"<USER_ID>","device_label":"Test Phone","platform":"android"}
 
 ### Create device key
-POST http://localhost:8000/device-keys
+POST https://localhost:8000/device-keys
 Content-Type: application/json
 
 {"device_id":"<DEVICE_ID>","rp_id":"<RP_UUID>","key_type":"ed25519","public_key":"BASE64_PUBLIC_KEY"}
 
 ### Enrollment (one request)
-POST http://localhost:8000/enroll
+POST https://localhost:8000/enroll
 Content-Type: application/json
 
 {
@@ -39,20 +39,8 @@ Content-Type: application/json
   "public_key": "BASE64_PUBLIC_KEY"
 }
 
-### Verify (not implemented yet)
-POST http://localhost:8000/verify
-Content-Type: application/json
-
-{
-  "user_id": "<USER_ID>",
-  "device_id": "<DEVICE_ID>",
-  "rp_id": "example.com",
-  "otp": "123456",
-  "device_proof": "BASE64_DEVICE_PROOF"
-}
-
 ### TOTP register (server-generated secret)
-POST http://localhost:8000/totp/register
+POST https://localhost:8000/totp/register
 Content-Type: application/json
 
 {
@@ -63,7 +51,7 @@ Content-Type: application/json
 }
 
 ### TOTP verify
-POST http://localhost:8000/totp/verify
+POST https://localhost:8000/totp/verify
 Content-Type: application/json
 
 {
@@ -73,7 +61,7 @@ Content-Type: application/json
 }
 
 ### Classic login (email + otp + rp_id + device_id)
-POST http://localhost:8000/login
+POST https://localhost:8000/login
 Content-Type: application/json
 
 {
@@ -82,16 +70,16 @@ Content-Type: application/json
 }
 
 ### Login form page
-GET http://localhost:8000/login-form
+GET https://localhost:8000/login-form
 
 ### Login status (poll from web client)
-GET http://localhost:8000/login/status?login_id=<LOGIN_ID>
+GET https://localhost:8000/login/status?login_id=<LOGIN_ID>
 
 ### Login pending (device polls)
-GET http://localhost:8000/login/pending?user_id=<USER_ID>
+GET https://localhost:8000/login/pending?user_id=<USER_ID>
 
 ### Login approve (device proof)
-POST http://localhost:8000/login/approve
+POST https://localhost:8000/login/approve
 Content-Type: application/json
 
 {
@@ -104,7 +92,7 @@ Content-Type: application/json
 }
 
 ### Login recovery (fallback)
-POST http://localhost:8000/login/recover
+POST https://localhost:8000/login/recover
 Content-Type: application/json
 
 {
@@ -113,7 +101,7 @@ Content-Type: application/json
 }
 
 ### Login deny (explicit device rejection)
-POST http://localhost:8000/login/deny
+POST https://localhost:8000/login/deny
 Content-Type: application/json
 
 {
@@ -122,7 +110,7 @@ Content-Type: application/json
 }
 
 ### Recovery code verify (consumes code)
-POST http://localhost:8000/totp/recovery/verify
+POST https://localhost:8000/totp/recovery/verify
 Content-Type: application/json
 
 {
@@ -131,7 +119,7 @@ Content-Type: application/json
 }
 
 ### ZT challenge (nonce)
-POST http://localhost:8000/zt/challenge
+POST https://localhost:8000/zt/challenge
 Content-Type: application/json
 
 {
@@ -142,7 +130,7 @@ Content-Type: application/json
 ### ZT verify (signed proof)
 # Signature is Ed25519 over: "<nonce>|<device_id>|<rp_id>|<otp>"
 # public_key is stored during enrollment as base64 raw 32-byte public key.
-POST http://localhost:8000/zt/verify
+POST https://localhost:8000/zt/verify
 Content-Type: application/json
 
 {
@@ -157,7 +145,7 @@ Content-Type: application/json
 }
 
 ### Rotate device key (public key update)
-POST http://localhost:8000/zt/rotate-key
+POST https://localhost:8000/zt/rotate-key
 Content-Type: application/json
 
 {
@@ -168,7 +156,7 @@ Content-Type: application/json
 }
 
 ### Enrollment QR (PNG)
-GET http://localhost:8000/enroll/qr?rp_id=example.com&email=alice@example.com&issuer=Example&account_name=alice@example.com&rp_display_name=Example%20RP&device_label=Research%20Phone
+GET https://localhost:8000/enroll/qr?rp_id=example.com&email=alice@example.com&issuer=Example&account_name=alice@example.com&rp_display_name=Example%20RP&device_label=Research%20Phone
 
 ### Enrollment QR page (HTML)
-GET http://localhost:8000/enroll/qr-page?rp_id=example.com&email=alice@example.com&issuer=Example&account_name=alice@example.com&rp_display_name=Example%20RP&device_label=Research%20Phone
+GET https://localhost:8000/enroll/qr-page?rp_id=example.com&email=alice@example.com&issuer=Example&account_name=alice@example.com&rp_display_name=Example%20RP&device_label=Research%20Phone

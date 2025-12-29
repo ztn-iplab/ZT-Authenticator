@@ -22,3 +22,5 @@ pubspec.lock
 *.iml
 .vscode/
 experiments/
+backend/certs/
+*.log

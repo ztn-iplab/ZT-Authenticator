@@ -19,8 +19,12 @@ Set a recovery pepper (any long random string).
 ## Run
 
 ```bash
-uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
+./scripts/generate_dev_cert.sh
+./run.sh
 ```
+
+The development server uses HTTPS by default. For production, terminate TLS with
+your load balancer or provide a trusted certificate.
 
 ## Initialize database schema
 
@@ -63,7 +67,7 @@ background using a device-bound signature.
 
 ## Classic login form (web)
 
-Open `http://<host>:8000/login-form` and submit only email + OTP.
+Open `https://<host>:8000/login-form` and submit only email + OTP.
 The server derives the RP and device from the latest enrollment for that user.
 The ZT-Authenticator app silently approves the login in the background.
 

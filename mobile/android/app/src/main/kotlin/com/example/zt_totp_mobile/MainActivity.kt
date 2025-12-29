@@ -22,12 +22,13 @@ class MainActivity : FlutterActivity() {
                 when (call.method) {
                     "generateKeypair" -> {
                         val rpId = call.argument<String>("rp_id") ?: ""
+                        val keyId = call.argument<String>("key_id") ?: ""
                         if (rpId.isBlank()) {
                             result.error("bad_args", "rp_id is required", null)
                             return@setMethodCallHandler
                         }
                         try {
-                            val publicKey = generateKeypair(rpId)
+                            val publicKey = generateKeypair(rpId, keyId)
                             result.success(publicKey)
                         } catch (error: Exception) {
                             result.error("keygen_failed", error.toString(), null)
@@ -38,12 +39,13 @@ class MainActivity : FlutterActivity() {
                         val nonce = call.argument<String>("nonce") ?: ""
                         val deviceId = call.argument<String>("device_id") ?: ""
                         val otp = call.argument<String>("otp") ?: ""
+                        val keyId = call.argument<String>("key_id") ?: ""
                         if (rpId.isBlank() || nonce.isBlank() || deviceId.isBlank() || otp.isBlank()) {
                             result.error("bad_args", "rp_id, nonce, device_id, and otp are required", null)
                             return@setMethodCallHandler
                         }
                         try {
-                            val signature = signPayload(rpId, nonce, deviceId, otp)
+                            val signature = signPayload(rpId, nonce, deviceId, otp, keyId)
                             result.success(signature)
                         } catch (error: Exception) {
                             result.error("sign_failed", error.toString(), null)
@@ -54,13 +56,14 @@ class MainActivity : FlutterActivity() {
             }
     }
 
-    private fun aliasForRp(rpId: String): String {
-        val sanitized = rpId.replace(Regex("[^a-zA-Z0-9._-]"), "_")
+    private fun aliasForKey(rpId: String, keyId: String): String {
+        val base = if (keyId.isNotBlank()) keyId else rpId
+        val sanitized = base.replace(Regex("[^a-zA-Z0-9._-]"), "_")
         return "zt_totp_$sanitized"
     }
 
-    private fun generateKeypair(rpId: String): String {
-        val alias = aliasForRp(rpId)
+    private fun generateKeypair(rpId: String, keyId: String): String {
+        val alias = aliasForKey(rpId, keyId)
         val keyStore = KeyStore.getInstance("AndroidKeyStore")
         keyStore.load(null)
 
@@ -88,8 +91,8 @@ class MainActivity : FlutterActivity() {
         return Base64.encodeToString(encoded, Base64.NO_WRAP)
     }
 
-    private fun signPayload(rpId: String, nonce: String, deviceId: String, otp: String): String {
-        val alias = aliasForRp(rpId)
+    private fun signPayload(rpId: String, nonce: String, deviceId: String, otp: String, keyId: String): String {
+        val alias = aliasForKey(rpId, keyId)
         val keyStore = KeyStore.getInstance("AndroidKeyStore")
         keyStore.load(null)
         val entry = keyStore.getEntry(alias, null) as? KeyStore.PrivateKeyEntry

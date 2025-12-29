@@ -1,7 +1,21 @@
 from datetime import datetime
 from uuid import UUID
 
+from typing import Optional
+
 from pydantic import BaseModel, EmailStr, Field
+
+
+class FeedbackRequest(BaseModel):
+    email: Optional[EmailStr] = None
+    subject: str = Field(..., min_length=3, max_length=120)
+    category: Optional[str] = Field(default=None, max_length=32)
+    message: str = Field(..., min_length=10, max_length=2000)
+    source: Optional[str] = Field(default=None, max_length=64)
+
+
+class FeedbackResponse(BaseModel):
+    status: str
 
 
 class UserCreate(BaseModel):

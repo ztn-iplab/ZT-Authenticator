@@ -3,10 +3,10 @@ import 'package:flutter/services.dart';
 class DeviceCrypto {
   static const MethodChannel _channel = MethodChannel('zt_device_crypto');
 
-  Future<String> generateKeypair({required String rpId}) async {
+  Future<String> generateKeypair({required String rpId, String? keyId}) async {
     final result = await _channel.invokeMethod<String>(
       'generateKeypair',
-      {'rp_id': rpId},
+      {'rp_id': rpId, 'key_id': keyId},
     );
     return result ?? '';
   }
@@ -16,6 +16,7 @@ class DeviceCrypto {
     required String nonce,
     required String deviceId,
     required String otp,
+    String? keyId,
   }) async {
     final result = await _channel.invokeMethod<String>(
       'sign',
@@ -24,6 +25,7 @@ class DeviceCrypto {
         'nonce': nonce,
         'device_id': deviceId,
         'otp': otp,
+        'key_id': keyId,
       },
     );
     return result ?? '';

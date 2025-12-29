@@ -1,15 +1,22 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:io';
 
 import 'package:flutter/material.dart';
+import 'package:flutter_slidable/flutter_slidable.dart';
+import 'package:flutter/services.dart';
+import 'app_settings.dart';
 import 'device_crypto.dart';
+import 'feedback_screen.dart';
+import 'help_screen.dart';
+import 'how_it_works_screen.dart';
 import 'http_client.dart';
 import 'qr_scanner_screen.dart';
+import 'settings_screen.dart';
 import 'totp.dart';
 import 'totp_store.dart';
-
-// Android emulator reaches host localhost via 10.0.2.2.
-const String apiBaseUrl = 'http://192.168.60.2:8000';
+import 'transfer_accounts_screen.dart';
+import 'zt_theme.dart';
 
 void main() {
   runApp(const ZtAuthenticatorApp());
@@ -23,27 +30,7 @@ class ZtAuthenticatorApp extends StatelessWidget {
   Widget build(BuildContext context) {
     return MaterialApp(
       title: 'ZT-Authenticator',
-      theme: ThemeData(
-        brightness: Brightness.dark,
-        scaffoldBackgroundColor: const Color(0xFF121212),
-        appBarTheme: const AppBarTheme(
-          backgroundColor: Color(0xFF121212),
-          foregroundColor: Colors.white,
-          elevation: 0,
-        ),
-        inputDecorationTheme: InputDecorationTheme(
-          filled: true,
-          fillColor: const Color(0xFF1F1F1F),
-          border: OutlineInputBorder(
-            borderRadius: BorderRadius.circular(24),
-            borderSide: BorderSide.none,
-          ),
-        ),
-        floatingActionButtonTheme: const FloatingActionButtonThemeData(
-          backgroundColor: Color(0xFF1F1F1F),
-          foregroundColor: Colors.white,
-        ),
-      ),
+      theme: ztIamTheme(),
       home: const HomeScreen(),
     );
   }
@@ -58,7 +45,9 @@ class HomeScreen extends StatefulWidget {
 }
 
 class _HomeScreenState extends State<HomeScreen> {
-  late final ApiClient _apiClient;
+  final AppSettings _settings = AppSettings();
+  bool _allowInsecureTls = false;
+  String _fallbackApiBaseUrl = '';
   final TotpStore _store = TotpStore();
   final List<TotpAccount> _totpAccounts = [];
   Timer? _ticker;
@@ -66,18 +55,41 @@ class _HomeScreenState extends State<HomeScreen> {
   final DeviceCrypto _deviceCrypto = DeviceCrypto();
   bool _approvalDialogOpen = false;
   String _lastLoginId = '';
+  bool _loginPollingEnabled = true;
 
   @override
   void initState() {
     super.initState();
-    _apiClient = ApiClient(baseUrl: apiBaseUrl);
-    print('API base URL: $apiBaseUrl');
     _loadAccounts();
     _ticker = Timer.periodic(const Duration(seconds: 1), (_) {
       if (mounted) {
         setState(() {});
       }
     });
+    _loadSettings();
+  }
+
+  Future<void> _loadSettings() async {
+    final storedBaseUrl = await _settings.loadApiBaseUrl();
+    final loginPollingEnabled = await _settings.loadLoginPollingEnabled();
+    final allowInsecureTls = await _settings.loadAllowInsecureTls();
+    if (!mounted) {
+      return;
+    }
+    setState(() {
+      _loginPollingEnabled = loginPollingEnabled;
+      _allowInsecureTls = allowInsecureTls;
+      _fallbackApiBaseUrl = storedBaseUrl ?? '';
+    });
+    _restartLoginPoller();
+  }
+
+  void _restartLoginPoller() {
+    _loginPoller?.cancel();
+    if (!_loginPollingEnabled) {
+      _loginPoller = null;
+      return;
+    }
     _loginPoller = Timer.periodic(const Duration(seconds: 5), (_) {
       _pollLoginApprovals();
     });
@@ -96,7 +108,6 @@ class _HomeScreenState extends State<HomeScreen> {
   void dispose() {
     _ticker?.cancel();
     _loginPoller?.cancel();
-    _apiClient.close();
     super.dispose();
   }
 
@@ -104,6 +115,217 @@ class _HomeScreenState extends State<HomeScreen> {
     setState(() {
       _totpAccounts.add(account);
     });
+  }
+
+  Future<void> _showAccountInfo() async {
+    final accounts = List<TotpAccount>.from(_totpAccounts);
+    await showDialog<void>(
+      context: context,
+      builder: (context) {
+        return AlertDialog(
+          title: const Text('Accounts'),
+          content: SizedBox(
+            width: double.maxFinite,
+            child: accounts.isEmpty
+                ? const Text('No accounts enrolled yet.')
+                : ListView.separated(
+                    shrinkWrap: true,
+                    itemCount: accounts.length,
+                    separatorBuilder: (_, __) => const Divider(height: 16),
+                    itemBuilder: (_, index) {
+                      final entry = accounts[index];
+                      final issuer = entry.displayIssuer();
+                      final account = entry.account.trim();
+                      return Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Text(
+                            issuer,
+                            style: const TextStyle(fontWeight: FontWeight.w600),
+                          ),
+                          if (account.isNotEmpty)
+                            Text(
+                              account,
+                              style: const TextStyle(color: Colors.white70),
+                            ),
+                        ],
+                      );
+                    },
+                  ),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.of(context).pop(),
+              child: const Text('Close'),
+            ),
+          ],
+        );
+      },
+    );
+  }
+
+  Future<void> _editAccount(TotpAccount account) async {
+    final issuerController = TextEditingController(text: account.issuer);
+    final accountController = TextEditingController(text: account.account);
+    final result = await showDialog<Map<String, String>>(
+      context: context,
+      builder: (context) {
+        return AlertDialog(
+          title: const Text('Edit account'),
+          content: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              TextField(
+                controller: issuerController,
+                decoration: const InputDecoration(labelText: 'Issuer'),
+              ),
+              const SizedBox(height: 8),
+              TextField(
+                controller: accountController,
+                decoration: const InputDecoration(labelText: 'Email/Account'),
+              ),
+            ],
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.of(context).pop(null),
+              child: const Text('Cancel'),
+            ),
+            ElevatedButton(
+              onPressed: () {
+                final issuer = issuerController.text.trim();
+                final accountLabel = accountController.text.trim();
+                if (issuer.isEmpty || accountLabel.isEmpty) {
+                  return;
+                }
+                Navigator.of(context).pop({
+                  'issuer': issuer,
+                  'account': accountLabel,
+                });
+              },
+              child: const Text('Save'),
+            ),
+          ],
+        );
+      },
+    );
+    if (result == null) {
+      return;
+    }
+
+    final updated = TotpAccount(
+      issuer: result['issuer'] ?? account.issuer,
+      account: result['account'] ?? account.account,
+      secret: account.secret,
+      userId: account.userId,
+      rpId: account.rpId,
+      deviceId: account.deviceId,
+      apiBaseUrl: account.apiBaseUrl,
+      keyId: account.keyId,
+    );
+    await _store.delete(account.toRecord());
+    await _store.save(updated.toRecord());
+    setState(() {
+      final idx = _totpAccounts.indexOf(account);
+      if (idx >= 0) {
+        _totpAccounts[idx] = updated;
+      }
+    });
+  }
+
+  Future<void> _deleteAccount(TotpAccount account) async {
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (context) {
+        return AlertDialog(
+          title: const Text('Remove account?'),
+          content: Text('Remove ${account.account} from this device?'),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.of(context).pop(false),
+              child: const Text('Cancel'),
+            ),
+            ElevatedButton(
+              style: ElevatedButton.styleFrom(
+                backgroundColor: Colors.redAccent,
+                foregroundColor: Colors.white,
+              ),
+              onPressed: () => Navigator.of(context).pop(true),
+              child: const Text('Delete'),
+            ),
+          ],
+        );
+      },
+    );
+    if (confirmed != true) {
+      return;
+    }
+    await _store.delete(account.toRecord());
+    setState(() {
+      _totpAccounts.remove(account);
+    });
+  }
+
+  String _profileInitial(List<TotpAccount> accounts) {
+    if (accounts.isEmpty) {
+      return 'P';
+    }
+    final raw = accounts.first.account.trim();
+    if (raw.isEmpty) {
+      return 'P';
+    }
+    final localPart = raw.contains('@') ? raw.split('@').first : raw;
+    if (localPart.isEmpty) {
+      return 'P';
+    }
+    return localPart[0].toUpperCase();
+  }
+
+  String _resolveAccountBaseUrl(TotpAccount account) {
+    if (account.apiBaseUrl.trim().isNotEmpty) {
+      return account.apiBaseUrl.trim();
+    }
+    if (account.rpId.trim().isNotEmpty) {
+      return 'https://${account.rpId.trim()}/api/auth';
+    }
+    return '';
+  }
+
+  Future<Map<String, dynamic>?> _accountGet(
+    TotpAccount account,
+    String path,
+  ) async {
+    final baseUrl = _resolveAccountBaseUrl(account);
+    if (baseUrl.isEmpty) {
+      return null;
+    }
+    final client = ApiClient(baseUrl: baseUrl, allowInsecureTls: _allowInsecureTls);
+    try {
+      final response = await client.get(path);
+      if (response.statusCode != 200) {
+        return null;
+      }
+      return jsonDecode(response.body) as Map<String, dynamic>;
+    } finally {
+      client.close();
+    }
+  }
+
+  Future<void> _accountPost(
+    TotpAccount account,
+    String path,
+    Map<String, dynamic> payload,
+  ) async {
+    final baseUrl = _resolveAccountBaseUrl(account);
+    if (baseUrl.isEmpty) {
+      return;
+    }
+    final client = ApiClient(baseUrl: baseUrl, allowInsecureTls: _allowInsecureTls);
+    try {
+      await client.postJson(path, payload);
+    } finally {
+      client.close();
+    }
   }
 
   Future<void> _pollLoginApprovals() async {
@@ -115,11 +337,10 @@ class _HomeScreenState extends State<HomeScreen> {
         continue;
       }
       try {
-        final response = await _apiClient.get('/login/pending?user_id=${account.userId}');
-        if (response.statusCode != 200) {
+        final data = await _accountGet(account, '/login/pending?user_id=${account.userId}');
+        if (data == null) {
           continue;
         }
-        final data = jsonDecode(response.body) as Map<String, dynamic>;
         if (data['status'] != 'pending') {
           continue;
         }
@@ -166,9 +387,13 @@ class _HomeScreenState extends State<HomeScreen> {
           title: const Text('Approve login?'),
           content: Text('Account: ${account.account}\nRP: ${account.rpId}'),
           actions: [
-            TextButton(
+            ElevatedButton(
+              style: ElevatedButton.styleFrom(
+                backgroundColor: Colors.redAccent,
+                foregroundColor: Colors.white,
+              ),
               onPressed: () async {
-                await _apiClient.postJson('/login/deny', {
+                await _accountPost(account, '/login/deny', {
                   'login_id': loginId,
                   'reason': 'user_denied',
                 });
@@ -179,6 +404,10 @@ class _HomeScreenState extends State<HomeScreen> {
               child: const Text('Deny'),
             ),
             ElevatedButton(
+              style: ElevatedButton.styleFrom(
+                backgroundColor: ZtIamColors.accentGreen,
+                foregroundColor: Colors.white,
+              ),
               onPressed: () async {
                 final otp = account.currentCode();
                 final signature = await _deviceCrypto.sign(
@@ -186,9 +415,10 @@ class _HomeScreenState extends State<HomeScreen> {
                   nonce: nonce,
                   deviceId: account.deviceId,
                   otp: otp,
+                  keyId: account.keyId.isEmpty ? account.rpId : account.keyId,
                 );
                 if (signature.isNotEmpty) {
-                  await _apiClient.postJson('/login/approve', {
+                  await _accountPost(account, '/login/approve', {
                     'login_id': loginId,
                     'device_id': account.deviceId,
                     'rp_id': account.rpId,
@@ -212,7 +442,7 @@ class _HomeScreenState extends State<HomeScreen> {
   void _openActions() {
     showModalBottomSheet<void>(
       context: context,
-      backgroundColor: const Color(0xFF1F1F1F),
+      backgroundColor: ZtIamColors.surface,
       shape: const RoundedRectangleBorder(
         borderRadius: BorderRadius.vertical(top: Radius.circular(16)),
       ),
@@ -232,38 +462,17 @@ class _HomeScreenState extends State<HomeScreen> {
                   Navigator.of(context).push(
                     MaterialPageRoute(
                       builder: (_) => TotpSetupScreen(
-                        apiClient: _apiClient,
+                        fallbackBaseUrl: _fallbackApiBaseUrl,
+                        onBaseUrlDetected: (baseUrl) {
+                          if (baseUrl.isEmpty) {
+                            return;
+                          }
+                          _settings.saveApiBaseUrl(baseUrl);
+                          setState(() {
+                            _fallbackApiBaseUrl = baseUrl;
+                          });
+                        },
                         onRegistered: _addTotpAccount,
-                      ),
-                    ),
-                  );
-                },
-              ),
-              _SheetAction(
-                icon: Icons.verified_user,
-                label: 'Verify',
-                onTap: () {
-                  Navigator.of(context).pop();
-                  Navigator.of(context).push(
-                    MaterialPageRoute(
-                      builder: (_) => VerifyScreen(
-                        apiClient: _apiClient,
-                        accounts: List<TotpAccount>.from(_totpAccounts),
-                      ),
-                    ),
-                  );
-                },
-              ),
-              _SheetAction(
-                icon: Icons.shield_outlined,
-                label: 'ZT Verify',
-                onTap: () {
-                  Navigator.of(context).pop();
-                  Navigator.of(context).push(
-                    MaterialPageRoute(
-                      builder: (_) => ZtVerifyScreen(
-                        apiClient: _apiClient,
-                        accounts: List<TotpAccount>.from(_totpAccounts),
                       ),
                     ),
                   );
@@ -277,9 +486,9 @@ class _HomeScreenState extends State<HomeScreen> {
                   Navigator.of(context).push(
                     MaterialPageRoute(
                       builder: (_) => LoginApprovalsScreen(
-                        apiClient: _apiClient,
                         accounts: List<TotpAccount>.from(_totpAccounts),
                         deviceCrypto: _deviceCrypto,
+                        allowInsecureTls: _allowInsecureTls,
                       ),
                     ),
                   );
@@ -310,44 +519,111 @@ class _HomeScreenState extends State<HomeScreen> {
   @override
   Widget build(BuildContext context) {
     final accounts = List<TotpAccount>.from(_totpAccounts);
+    final profileInitial = _profileInitial(accounts);
 
     return Scaffold(
       appBar: AppBar(
         title: const Text('ZT-Authenticator'),
         actions: [
-          IconButton(
-            icon: const Icon(Icons.cloud_done),
-            onPressed: () {
-              ScaffoldMessenger.of(context).showSnackBar(
-                const SnackBar(content: Text('Sync placeholder')),
-              );
-            },
-          ),
-          const Padding(
-            padding: EdgeInsets.only(right: 12),
-            child: CircleAvatar(
-              backgroundColor: Color(0xFF2A2A2A),
-              child: Text('P'),
+          Padding(
+            padding: const EdgeInsets.only(right: 12),
+            child: InkWell(
+              onTap: _showAccountInfo,
+              borderRadius: BorderRadius.circular(20),
+              child: CircleAvatar(
+                backgroundColor: ZtIamColors.card,
+                child: Text(profileInitial),
+              ),
             ),
           ),
         ],
       ),
-      drawer: const _AppDrawer(),
-      body: ListView(
-        padding: const EdgeInsets.all(16),
-        children: [
-          TextField(
-            decoration: const InputDecoration(
-              hintText: 'Search...',
-              prefixIcon: Icon(Icons.search),
+      drawer: _AppDrawer(
+        onTransferAccounts: () async {
+          final changed = await Navigator.of(context).push<bool>(
+            MaterialPageRoute(
+              builder: (_) => TransferAccountsScreen(store: _store),
             ),
-          ),
-          const SizedBox(height: 16),
-          if (accounts.isEmpty)
-            const _EmptyState()
-          else
-            ...accounts.map((entry) => _AccountTile(entry: entry)),
-        ],
+          );
+          if (changed == true) {
+            await _loadAccounts();
+          }
+        },
+        onHowItWorks: () {
+          Navigator.of(context).push(
+            MaterialPageRoute(builder: (_) => const HowItWorksScreen()),
+          );
+        },
+        onSettings: () async {
+          final result = await Navigator.of(context).push<SettingsResult>(
+            MaterialPageRoute(
+              builder: (_) => SettingsScreen(
+                initialLoginPolling: _loginPollingEnabled,
+                initialAllowInsecureTls: _allowInsecureTls,
+                settings: _settings,
+              ),
+            ),
+          );
+          if (result == null) {
+            return;
+          }
+          setState(() {
+            _loginPollingEnabled = result.loginPolling;
+            _allowInsecureTls = result.allowInsecureTls;
+          });
+          _restartLoginPoller();
+        },
+        onSendFeedback: () {
+          final baseUrl = _totpAccounts
+              .map(_resolveAccountBaseUrl)
+              .firstWhere((value) => value.isNotEmpty, orElse: () => _fallbackApiBaseUrl);
+          if (baseUrl.isEmpty) {
+            ScaffoldMessenger.of(context).showSnackBar(
+              const SnackBar(content: Text('No server available for feedback.')),
+            );
+            return;
+          }
+          Navigator.of(context).push(
+            MaterialPageRoute(
+              builder: (_) => FeedbackScreen(
+                apiClient: ApiClient(
+                  baseUrl: baseUrl,
+                  allowInsecureTls: _allowInsecureTls,
+                ),
+              ),
+            ),
+          );
+        },
+        onHelp: () {
+          Navigator.of(context).push(
+            MaterialPageRoute(builder: (_) => const HelpScreen()),
+          );
+        },
+      ),
+      body: Container(
+        decoration: const BoxDecoration(gradient: ZtIamColors.backgroundGradient),
+        child: ListView(
+          padding: const EdgeInsets.all(16),
+          children: [
+            TextField(
+              decoration: const InputDecoration(
+                hintText: 'Search...',
+                prefixIcon: Icon(Icons.search),
+              ),
+            ),
+            const SizedBox(height: 16),
+            if (accounts.isEmpty)
+              const _EmptyState()
+            else
+              ...accounts.map(
+                (entry) => _AccountRow(
+                  entry: entry,
+                  onEdit: () => _editAccount(entry),
+                  onDelete: () => _deleteAccount(entry),
+                ),
+              ),
+          ],
+        ),
       ),
       floatingActionButton: FloatingActionButton(
         onPressed: _openActions,
@@ -365,6 +641,8 @@ class TotpAccount {
     required this.userId,
     required this.rpId,
     required this.deviceId,
+    required this.apiBaseUrl,
+    required this.keyId,
   });
 
   final String issuer;
@@ -373,6 +651,58 @@ class TotpAccount {
   final String userId;
   final String rpId;
   final String deviceId;
+  final String apiBaseUrl;
+  final String keyId;
+
+  String displayIssuer() {
+    final issuerValue = issuer.trim();
+    if (issuerValue.isEmpty) {
+      return _shortenDomain(rpId);
+    }
+    final cleanedIssuer = _normalizeIssuer(issuerValue);
+    final detectedDomain = _extractDomain(cleanedIssuer);
+    if (detectedDomain.isNotEmpty) {
+      return detectedDomain;
+    }
+    if (cleanedIssuer.contains('@')) {
+      final domain = cleanedIssuer.split('@').last.trim();
+      return _shortenDomain(domain);
+    }
+    return _shortenDomain(cleanedIssuer);
+  }
+
+  String _normalizeIssuer(String value) {
+    final trimmed = value.trim();
+    if (trimmed.isEmpty) {
+      return '';
+    }
+    final dotParts = trimmed.split('.');
+    if (dotParts.length == 2 && dotParts[0].toLowerCase() == dotParts[1].toLowerCase()) {
+      return dotParts[0];
+    }
+    final colonParts = trimmed.split(':');
+    if (colonParts.length == 2 && colonParts[0].toLowerCase() == colonParts[1].toLowerCase()) {
+      return colonParts[0];
+    }
+    return trimmed;
+  }
+
+  String _extractDomain(String value) {
+    final match = RegExp(r'([A-Za-z0-9-]+\.)+[A-Za-z]{2,}').firstMatch(value);
+    if (match == null) {
+      return '';
+    }
+    return _shortenDomain(match.group(0) ?? '');
+  }
+
+  String _shortenDomain(String value) {
+    final trimmed = value.trim();
+    if (trimmed.isEmpty) {
+      return 'Unknown issuer';
+    }
+    final cleaned = trimmed.replaceFirst(RegExp(r'^https?://'), '');
+    return cleaned.split('/').first;
+  }
 
   String currentCode() {
     return generateTotp(secret.replaceAll(' ', '').toUpperCase());
@@ -396,6 +726,8 @@ class TotpAccount {
       userId: record.userId,
       rpId: record.rpId,
       deviceId: record.deviceId,
+      apiBaseUrl: record.apiBaseUrl,
+      keyId: record.keyId,
     );
   }
 
@@ -407,6 +739,45 @@ class TotpAccount {
       userId: userId,
       rpId: rpId,
       deviceId: deviceId,
+      apiBaseUrl: apiBaseUrl,
+      keyId: keyId,
+    );
+  }
+}
+
+class _AccountRow extends StatelessWidget {
+  const _AccountRow({
+    required this.entry,
+    required this.onEdit,
+    required this.onDelete,
+  });
+
+  final TotpAccount entry;
+  final VoidCallback onEdit;
+  final VoidCallback onDelete;
+
+  @override
+  Widget build(BuildContext context) {
+    return Slidable(
+      key: ValueKey('${entry.issuer}|${entry.account}|${entry.deviceId}'),
+      startActionPane: ActionPane(
+        motion: const StretchMotion(),
+        children: [
+          SlidableAction(
+            onPressed: (_) => onEdit(),
+            backgroundColor: ZtIamColors.accentBlueDark,
+            foregroundColor: Colors.white,
+            icon: Icons.edit,
+          ),
+          SlidableAction(
+            onPressed: (_) => onDelete(),
+            backgroundColor: Colors.redAccent,
+            foregroundColor: Colors.white,
+            icon: Icons.delete,
+          ),
+        ],
+      ),
+      child: _AccountTile(entry: entry),
     );
   }
 }
@@ -420,9 +791,12 @@ class _AccountTile extends StatelessWidget {
   Widget build(BuildContext context) {
     final code = entry.currentCode();
     final progress = entry.progress();
+    final issuer = entry.displayIssuer();
+    final account = entry.account.trim();
+    final header = account.isEmpty ? issuer : '$issuer:$account';
 
     return Padding(
-      padding: const EdgeInsets.only(bottom: 12),
+      padding: const EdgeInsets.only(bottom: 8),
       child: Row(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
@@ -431,19 +805,35 @@ class _AccountTile extends StatelessWidget {
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
                 Text(
-                  '${entry.issuer}: ${entry.account}',
-                  style: const TextStyle(fontSize: 15, color: Colors.white70),
+                  header,
+                  style: const TextStyle(
+                    fontSize: 15,
+                    fontWeight: FontWeight.w600,
+                    color: Colors.white,
+                  ),
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
                 ),
                 const SizedBox(height: 8),
-                Text(
-                  _formatCode(code),
-                  style: const TextStyle(
-                    fontSize: 36,
-                    letterSpacing: 2,
-                    color: Color(0xFFB3C7FF),
+                GestureDetector(
+                  onLongPress: () async {
+                    await Clipboard.setData(ClipboardData(text: code));
+                    if (context.mounted) {
+                      ScaffoldMessenger.of(context).showSnackBar(
+                        const SnackBar(content: Text('TOTP code copied')),
+                      );
+                    }
+                  },
+                  child: Text(
+                    _formatCode(code),
+                    style: const TextStyle(
+                      fontSize: 32,
+                      letterSpacing: 2,
+                      color: ZtIamColors.accentSoft,
+                    ),
                   ),
                 ),
-                const Divider(color: Color(0xFF2A2A2A)),
+                const Divider(color: ZtIamColors.divider),
               ],
             ),
           ),
@@ -454,8 +844,8 @@ class _AccountTile extends StatelessWidget {
             child: CircularProgressIndicator(
               value: progress,
               strokeWidth: 4,
-              color: const Color(0xFF7AA2FF),
-              backgroundColor: const Color(0xFF2A2A2A),
+              color: ZtIamColors.accentSoftMuted,
+              backgroundColor: ZtIamColors.divider,
             ),
           ),
         ],
@@ -499,27 +889,59 @@ class _EmptyState extends StatelessWidget {
 }
 
 class _AppDrawer extends StatelessWidget {
-  const _AppDrawer();
+  const _AppDrawer({
+    required this.onTransferAccounts,
+    required this.onHowItWorks,
+    required this.onSettings,
+    required this.onSendFeedback,
+    required this.onHelp,
+  });
+
+  final VoidCallback onTransferAccounts;
+  final VoidCallback onHowItWorks;
+  final VoidCallback onSettings;
+  final VoidCallback onSendFeedback;
+  final VoidCallback onHelp;
 
   @override
   Widget build(BuildContext context) {
     return Drawer(
-      backgroundColor: const Color(0xFF1A1A1A),
+      backgroundColor: ZtIamColors.surface,
       child: SafeArea(
         child: ListView(
           padding: const EdgeInsets.all(16),
-          children: const [
-            Text(
+          children: [
+            const Text(
               'ZT-Authenticator',
               style: TextStyle(fontSize: 20, color: Colors.white),
             ),
-            SizedBox(height: 24),
-            _DrawerItem(icon: Icons.sync_alt, label: 'Transfer accounts'),
-            _DrawerItem(icon: Icons.info_outline, label: 'How it works'),
-            Divider(color: Color(0xFF2A2A2A)),
-            _DrawerItem(icon: Icons.settings, label: 'Settings'),
-            _DrawerItem(icon: Icons.feedback_outlined, label: 'Send feedback'),
-            _DrawerItem(icon: Icons.help_outline, label: 'Help'),
+            const SizedBox(height: 24),
+            _DrawerItem(
+              icon: Icons.sync_alt,
+              label: 'Transfer accounts',
+              onTap: onTransferAccounts,
+            ),
+            _DrawerItem(
+              icon: Icons.info_outline,
+              label: 'How it works',
+              onTap: onHowItWorks,
+            ),
+            const Divider(color: ZtIamColors.divider),
+            _DrawerItem(
+              icon: Icons.settings,
+              label: 'Settings',
+              onTap: onSettings,
+            ),
+            _DrawerItem(
+              icon: Icons.feedback_outlined,
+              label: 'Send feedback',
+              onTap: onSendFeedback,
+            ),
+            _DrawerItem(
+              icon: Icons.help_outline,
+              label: 'Help',
+              onTap: onHelp,
+            ),
           ],
         ),
       ),
@@ -528,17 +950,25 @@ class _AppDrawer extends StatelessWidget {
 }
 
 class _DrawerItem extends StatelessWidget {
-  const _DrawerItem({required this.icon, required this.label});
+  const _DrawerItem({
+    required this.icon,
+    required this.label,
+    this.onTap,
+  });
 
   final IconData icon;
   final String label;
+  final VoidCallback? onTap;
 
   @override
   Widget build(BuildContext context) {
     return ListTile(
       leading: Icon(icon, color: Colors.white70),
       title: Text(label, style: const TextStyle(color: Colors.white70)),
-      onTap: () => Navigator.of(context).pop(),
+      onTap: () {
+        Navigator.of(context).pop();
+        onTap?.call();
+      },
     );
   }
 }
@@ -552,7 +982,7 @@ class _BottomSheetHandle extends StatelessWidget {
       width: 48,
       height: 4,
       decoration: BoxDecoration(
-        color: const Color(0xFF3A3A3A),
+        color: ZtIamColors.divider,
         borderRadius: BorderRadius.circular(4),
       ),
     );
@@ -584,11 +1014,13 @@ class _SheetAction extends StatelessWidget {
 class TotpSetupScreen extends StatefulWidget {
   const TotpSetupScreen({
     super.key,
-    required this.apiClient,
+    required this.fallbackBaseUrl,
+    this.onBaseUrlDetected,
     required this.onRegistered,
   });
 
-  final ApiClient apiClient;
+  final String fallbackBaseUrl;
+  final ValueChanged<String>? onBaseUrlDetected;
   final ValueChanged<TotpAccount> onRegistered;
 
   @override
@@ -598,9 +1030,15 @@ class TotpSetupScreen extends StatefulWidget {
 class _TotpSetupScreenState extends State<TotpSetupScreen> {
   final TotpStore _store = TotpStore();
   final DeviceCrypto _deviceCrypto = DeviceCrypto();
+  final AppSettings _settings = AppSettings();
+  final TextEditingController _setupKeyController = TextEditingController();
   String _status = '';
   List<String> _recoveryCodes = [];
   bool _loading = false;
+  Map<String, dynamic>? _pendingPayload;
+  String _detectedBaseUrl = '';
+  String _connectivityHint = '';
+  bool _allowInsecureTls = false;
   String _lastEmail = '';
   String _lastRpId = '';
   String _lastIssuer = '';
@@ -610,6 +1048,7 @@ class _TotpSetupScreenState extends State<TotpSetupScreen> {
 
   @override
   void dispose() {
+    _setupKeyController.dispose();
     super.dispose();
   }
 
@@ -638,12 +1077,266 @@ class _TotpSetupScreenState extends State<TotpSetupScreen> {
       return;
     }
 
+    await _startEnrollment(payload);
+  }
+
+  @override
+  void initState() {
+    super.initState();
+    _loadPendingEnrollment();
+    _loadTlsSetting();
+  }
+
+  Future<void> _loadPendingEnrollment() async {
+    final raw = await _settings.loadPendingEnrollment();
+    if (raw == null || raw.isEmpty) {
+      return;
+    }
+    try {
+      final decoded = jsonDecode(raw) as Map<String, dynamic>;
+      if (!mounted) {
+        return;
+      }
+      setState(() {
+        _pendingPayload = decoded;
+      });
+    } catch (_) {
+      await _settings.clearPendingEnrollment();
+    }
+  }
+
+  Future<void> _loadTlsSetting() async {
+    final allowInsecureTls = await _settings.loadAllowInsecureTls();
+    if (!mounted) {
+      return;
+    }
+    setState(() {
+      _allowInsecureTls = allowInsecureTls;
+    });
+  }
+
+  String _resolveApiBaseUrl(Map<String, dynamic> payload) {
+    final rawBase = (payload['api_base_url'] as String?)?.trim() ??
+        (payload['base_url'] as String?)?.trim() ??
+        (payload['enroll_url'] as String?)?.trim() ??
+        '';
+    if (rawBase.isNotEmpty) {
+      final cleaned = _stripWhitespace(rawBase);
+      if (cleaned.startsWith('http://') || cleaned.startsWith('https://')) {
+        return _normalizeBaseUrl(cleaned);
+      }
+      return _normalizeBaseUrl('https://$cleaned');
+    }
+    final rpId = (payload['rp_id'] as String?)?.trim() ?? '';
+    if (rpId.isEmpty) {
+      return '';
+    }
+    return _normalizeBaseUrl('https://$rpId/api/auth');
+  }
+
+  String _normalizeBaseUrl(String value) {
+    try {
+      final cleaned = _stripWhitespace(value);
+      final uri = Uri.parse(cleaned);
+      final scheme = uri.scheme.isEmpty || uri.scheme == 'http' ? 'https' : uri.scheme;
+      final host = uri.host.isEmpty ? uri.path : uri.host;
+      final port = uri.hasPort ? ':${uri.port}' : '';
+      final path = uri.path;
+      if (path.contains('/api/auth')) {
+        return '$scheme://$host$port/api/auth';
+      }
+      if (path.endsWith('/enroll')) {
+        final trimmed = path.substring(0, path.length - '/enroll'.length);
+        return '$scheme://$host$port$trimmed';
+      }
+      if (path.isNotEmpty && path != '/') {
+        return '$scheme://$host$port$path';
+      }
+      return '$scheme://$host$port/api/auth';
+    } catch (_) {
+      return '';
+    }
+  }
+
+  String _stripWhitespace(String value) {
+    return value.replaceAll(RegExp(r'\s+'), '');
+  }
+
+  String _normalizeSecret(String value) {
+    return value.replaceAll(RegExp(r'\s+'), '').toUpperCase();
+  }
+
+  bool _looksLikeBase32(String value) {
+    return RegExp(r'^[A-Z2-7]+=*$').hasMatch(value);
+  }
+
+  Map<String, String>? _parseOtpauth(String raw) {
+    final uri = Uri.tryParse(raw);
+    if (uri == null || uri.scheme != 'otpauth') {
+      return null;
+    }
+    final secret = (uri.queryParameters['secret'] ?? '').trim();
+    if (secret.isEmpty) {
+      return null;
+    }
+    String issuer = (uri.queryParameters['issuer'] ?? '').trim();
+    String account = '';
+    if (uri.path.isNotEmpty) {
+      final label = Uri.decodeComponent(uri.path.replaceFirst('/', ''));
+      if (label.contains(':')) {
+        final parts = label.split(':');
+        if (issuer.isEmpty) {
+          issuer = parts.first.trim();
+        }
+        account = parts.sublist(1).join(':').trim();
+      } else {
+        account = label.trim();
+      }
+    }
+    return {
+      'secret': secret,
+      'issuer': issuer,
+      'account': account,
+    };
+  }
+
+  Future<Map<String, dynamic>?> _tryParseEnrollmentPayload(String raw) async {
+    final trimmed = raw.trim();
+    if (trimmed.isEmpty) {
+      return null;
+    }
+    if (trimmed.startsWith('{') && trimmed.endsWith('}')) {
+      try {
+        final decoded = jsonDecode(trimmed);
+        if (decoded is Map<String, dynamic> && decoded['type'] == 'zt_totp_enroll') {
+          return decoded;
+        }
+      } catch (_) {
+        return null;
+      }
+    }
+    final url = Uri.tryParse(trimmed);
+    if (url != null && url.scheme.startsWith('http')) {
+      final client = ApiClient(
+        baseUrl: '${url.scheme}://${url.authority}',
+        allowInsecureTls: _allowInsecureTls,
+      );
+      try {
+        final path = url.hasQuery ? '${url.path}?${url.query}' : url.path;
+        final response = await client.get(path);
+        if (response.statusCode != 200) {
+          return null;
+        }
+        final decoded = jsonDecode(response.body);
+        if (decoded is Map<String, dynamic> && decoded['type'] == 'zt_totp_enroll') {
+          return decoded;
+        }
+      } catch (_) {
+        return null;
+      } finally {
+        client.close();
+      }
+    }
+
+    const prefix = 'ZTENROLL:';
+    if (!trimmed.toUpperCase().startsWith(prefix)) {
+      return null;
+    }
+    final payloadPart = trimmed
+        .substring(prefix.length)
+        .replaceAll(RegExp(r'\s+'), '')
+        .trim();
+    if (payloadPart.isEmpty) {
+      return null;
+    }
+    try {
+      final decodedBytes = base64Url.decode(base64Url.normalize(payloadPart));
+      final decodedJson = utf8.decode(decodedBytes);
+      final decoded = jsonDecode(decodedJson);
+      if (decoded is Map<String, dynamic> && decoded['type'] == 'zt_totp_enroll') {
+        return decoded;
+      }
+    } catch (_) {
+      return null;
+    }
+    return null;
+  }
+
+  Future<void> _submitSetupKey() async {
+    if (_loading) {
+      return;
+    }
+    final raw = _setupKeyController.text.trim();
+    if (raw.isEmpty) {
+      setState(() {
+        _status = 'Enter an enrollment code or otpauth URI.';
+      });
+      return;
+    }
+
+    final enrollmentPayload = await _tryParseEnrollmentPayload(raw);
+    if (enrollmentPayload != null) {
+      await _startEnrollment(enrollmentPayload);
+      return;
+    }
+
+    final parsed = _parseOtpauth(raw);
+    var secret = parsed?['secret'] ?? raw;
+    var issuer = parsed?['issuer'] ?? '';
+    var account = parsed?['account'] ?? '';
+
+    secret = _normalizeSecret(secret);
+    if (secret.isEmpty || !_looksLikeBase32(secret)) {
+      setState(() {
+        _status = 'Setup key must be a valid base32 secret.';
+      });
+      return;
+    }
+    if (issuer.isEmpty) {
+      issuer = 'Local';
+    }
+
+    final record = TotpRecord(
+      issuer: issuer,
+      account: account,
+      secret: secret,
+      userId: '',
+      rpId: '',
+      deviceId: '',
+      apiBaseUrl: '',
+      keyId: '',
+    );
+    await _store.save(record);
+    widget.onRegistered(TotpAccount.fromRecord(record));
+    setState(() {
+      _status = 'Setup key added.';
+      _setupKeyController.clear();
+    });
+  }
+
+  bool _isLocalhostHost(String host) {
+    return host == 'localhost' ||
+        host == '127.0.0.1' ||
+        host.endsWith('.local') ||
+        host.endsWith('.localdomain.com');
+  }
+
+  String _buildKeyId(String rpId, String email) {
+    final safeEmail = email.trim().toLowerCase();
+    if (safeEmail.isEmpty) {
+      return rpId.trim();
+    }
+    return '${rpId.trim()}|$safeEmail';
+  }
+
+  Future<void> _startEnrollment(Map<String, dynamic> payload) async {
     final email = (payload['email'] as String?)?.trim() ?? '';
     final rpId = (payload['rp_id'] as String?)?.trim() ?? '';
     final rpDisplayName =
         (payload['rp_display_name'] as String?)?.trim() ?? rpId;
     final issuer = (payload['issuer'] as String?)?.trim() ?? '';
     final accountName = (payload['account_name'] as String?)?.trim() ?? '';
+    final enrollToken = (payload['enroll_token'] as String?)?.trim() ?? '';
     final deviceLabel =
         (payload['device_label'] as String?)?.trim() ?? 'Android Device';
     if (email.isEmpty ||
@@ -656,13 +1349,47 @@ class _TotpSetupScreenState extends State<TotpSetupScreen> {
       return;
     }
 
+    final detectedBaseUrl = _resolveApiBaseUrl(payload);
+    if (detectedBaseUrl.isNotEmpty) {
+      await _settings.saveApiBaseUrl(detectedBaseUrl);
+      widget.onBaseUrlDetected?.call(detectedBaseUrl);
+    }
+    if (mounted) {
+      setState(() {
+        _detectedBaseUrl = detectedBaseUrl;
+        if (detectedBaseUrl.isNotEmpty) {
+          final host = Uri.tryParse(detectedBaseUrl)?.host ?? '';
+          _connectivityHint = _isLocalhostHost(host)
+              ? 'Tip: use a LAN IP or tunnel URL for mobile devices.'
+              : '';
+        }
+      });
+    }
+
     setState(() {
       _loading = true;
       _status = 'Enrolling device...';
     });
 
     try {
-      final publicKey = await _deviceCrypto.generateKeypair(rpId: rpId);
+      final baseUrl = detectedBaseUrl.isNotEmpty
+          ? detectedBaseUrl
+          : widget.fallbackBaseUrl.trim();
+      if (baseUrl.isEmpty) {
+        setState(() {
+          _status = 'Enrollment needs a valid server URL.';
+        });
+        return;
+      }
+      final enrollClient = ApiClient(
+        baseUrl: baseUrl,
+        allowInsecureTls: _allowInsecureTls,
+      );
+      final keyId = _buildKeyId(rpId, email);
+      final publicKey = await _deviceCrypto.generateKeypair(
+        rpId: rpId,
+        keyId: keyId,
+      );
       if (publicKey.isEmpty) {
         setState(() {
           _status = 'Key generation failed.';
@@ -672,19 +1399,26 @@ class _TotpSetupScreenState extends State<TotpSetupScreen> {
       final enrollPayload = {
         'email': email,
         'device_label': deviceLabel,
-        'platform': 'android',
+        'platform': Platform.isIOS ? 'ios' : Platform.isAndroid ? 'android' : 'unknown',
         'rp_id': rpId,
         'rp_display_name': rpDisplayName,
         'key_type': 'p256',
         'public_key': publicKey,
       };
-      final enrollResponse = await widget.apiClient.postJson(
+      if (enrollToken.isNotEmpty) {
+        enrollPayload['enroll_token'] = enrollToken;
+      }
+      final enrollResponse = await enrollClient.postJson(
         '/enroll',
         enrollPayload,
       );
       if (enrollResponse.statusCode != 200) {
         setState(() {
           _status = 'Enrollment failed: ${enrollResponse.body}';
+        });
+        await _settings.savePendingEnrollment(jsonEncode(payload));
+        setState(() {
+          _pendingPayload = payload;
         });
         return;
       }
@@ -702,7 +1436,7 @@ class _TotpSetupScreenState extends State<TotpSetupScreen> {
         _status = 'Registering TOTP...';
       });
 
-      final totpResponse = await widget.apiClient.postJson(
+      final totpResponse = await enrollClient.postJson(
         '/totp/register',
         {
           'user_id': userId,
@@ -734,6 +1468,8 @@ class _TotpSetupScreenState extends State<TotpSetupScreen> {
             userId: userId,
             rpId: rpId,
             deviceId: deviceId,
+            apiBaseUrl: detectedBaseUrl,
+            keyId: keyId,
           );
           await _store.save(record);
           widget.onRegistered(TotpAccount.fromRecord(record));
@@ -742,9 +1478,17 @@ class _TotpSetupScreenState extends State<TotpSetupScreen> {
       setState(() {
         _status = 'Enrollment complete.';
       });
+      await _settings.clearPendingEnrollment();
+      setState(() {
+        _pendingPayload = null;
+      });
     } catch (error) {
       setState(() {
         _status = 'Error: $error';
+      });
+      await _settings.savePendingEnrollment(jsonEncode(payload));
+      setState(() {
+        _pendingPayload = payload;
       });
     } finally {
       if (mounted) {
@@ -766,10 +1510,86 @@ class _TotpSetupScreenState extends State<TotpSetupScreen> {
             title: 'Enrollment QR',
             subtitle: 'Scan a single QR to enroll and register TOTP.',
           ),
+          if (_pendingPayload != null) ...[
+            const SizedBox(height: 12),
+            Card(
+              child: Padding(
+                padding: const EdgeInsets.all(16),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    const Text(
+                      'Pending enrollment detected',
+                      style: TextStyle(
+                        color: ZtIamColors.textPrimary,
+                        fontSize: 16,
+                        fontWeight: FontWeight.w600,
+                      ),
+                    ),
+                    const SizedBox(height: 8),
+                    const Text(
+                      'Retry enrollment when the connection improves.',
+                      style: TextStyle(color: ZtIamColors.textSecondary),
+                    ),
+                    const SizedBox(height: 12),
+                    ElevatedButton(
+                      onPressed: _loading
+                          ? null
+                          : () async {
+                              final payload = _pendingPayload;
+                              if (payload != null) {
+                                await _startEnrollment(payload);
+                              }
+                            },
+                      child: const Text('Retry enrollment'),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          ],
           const SizedBox(height: 16),
           ElevatedButton(
             onPressed: _loading ? null : _scanQr,
             child: Text(_loading ? 'Working...' : 'Scan Enrollment QR'),
+          ),
+          if (_detectedBaseUrl.isNotEmpty) ...[
+            const SizedBox(height: 8),
+            Text(
+              'API: $_detectedBaseUrl',
+              style: const TextStyle(color: Colors.white70),
+            ),
+            if (_connectivityHint.isNotEmpty) ...[
+              const SizedBox(height: 4),
+              Text(
+                _connectivityHint,
+                style: const TextStyle(color: Colors.white54),
+              ),
+            ],
+          ],
+          const SizedBox(height: 20),
+          const _SectionHeader(
+            title: 'Setup key',
+            subtitle: 'Paste the enrollment link or a base32 secret.',
+          ),
+          const SizedBox(height: 12),
+          TextField(
+            controller: _setupKeyController,
+            maxLines: 3,
+            decoration: const InputDecoration(
+              labelText: 'Setup key or payload',
+              hintText: 'https://.../enroll-code/XXXX or otpauth://totp/...',
+            ),
+          ),
+          const SizedBox(height: 12),
+          ElevatedButton(
+            onPressed: _loading ? null : _submitSetupKey,
+            child: const Text('Add code'),
+          ),
+          const SizedBox(height: 4),
+          const Text(
+            'Manual base32 setup is local-only and will show as Local.',
+            style: TextStyle(color: Colors.white54),
           ),
           const SizedBox(height: 12),
           if (_lastUserId.isNotEmpty || _lastDeviceId.isNotEmpty) ...[
@@ -794,368 +1614,6 @@ class _TotpSetupScreenState extends State<TotpSetupScreen> {
           ],
           const SizedBox(height: 12),
           Text(_status, style: const TextStyle(color: Colors.white70)),
-          if (_recoveryCodes.isNotEmpty) ...[
-            const SizedBox(height: 16),
-            const _SectionHeader(
-              title: 'Recovery Codes',
-              subtitle: 'Save these offline. They will not be shown again.',
-            ),
-            const SizedBox(height: 8),
-            Wrap(
-              spacing: 8,
-              runSpacing: 8,
-              children: _recoveryCodes
-                  .map(
-                    (code) => Chip(
-                      label: Text(code),
-                      backgroundColor: const Color(0xFF2A2A2A),
-                      labelStyle: const TextStyle(color: Colors.white),
-                    ),
-                  )
-                  .toList(),
-            ),
-          ],
-        ],
-      ),
-    );
-  }
-}
-
-// Verification flow: calls backend /totp/verify.
-class VerifyScreen extends StatefulWidget {
-  const VerifyScreen({
-    super.key,
-    required this.apiClient,
-    required this.accounts,
-  });
-
-  final ApiClient apiClient;
-  final List<TotpAccount> accounts;
-
-  @override
-  State<VerifyScreen> createState() => _VerifyScreenState();
-}
-
-// ZT-TOTP verification flow with server challenge + placeholder signature.
-class ZtVerifyScreen extends StatefulWidget {
-  const ZtVerifyScreen({
-    super.key,
-    required this.apiClient,
-    required this.accounts,
-  });
-
-  final ApiClient apiClient;
-  final List<TotpAccount> accounts;
-
-  @override
-  State<ZtVerifyScreen> createState() => _ZtVerifyScreenState();
-}
-
-class _ZtVerifyScreenState extends State<ZtVerifyScreen> {
-  String? _selectedKey;
-  String _status = '';
-  bool _loading = false;
-  String _nonce = '';
-  final TotpStore _store = TotpStore();
-  final DeviceCrypto _deviceCrypto = DeviceCrypto();
-  final _userIdController = TextEditingController();
-  final _rpIdController = TextEditingController();
-  final _deviceIdController = TextEditingController();
-
-  @override
-  void initState() {
-    super.initState();
-    if (widget.accounts.isNotEmpty) {
-      final first = widget.accounts.first;
-      _selectedKey = _accountKey(first);
-    }
-    _syncControllers();
-  }
-
-  void _syncControllers() {
-    final account = _currentAccount();
-    if (account == null) {
-      return;
-    }
-    _userIdController.text = account.userId;
-    _rpIdController.text = account.rpId;
-    _deviceIdController.text = account.deviceId;
-  }
-
-  TotpAccount? _currentAccount() {
-    final key = _selectedKey;
-    if (key == null) {
-      return null;
-    }
-    for (final account in widget.accounts) {
-      if (_accountKey(account) == key) {
-        return account;
-      }
-    }
-    return null;
-  }
-
-  String _accountKey(TotpAccount account) {
-    return '${account.issuer}|${account.account}';
-  }
-
-  @override
-  void dispose() {
-    _userIdController.dispose();
-    _rpIdController.dispose();
-    _deviceIdController.dispose();
-    super.dispose();
-  }
-
-  Future<void> _saveIds() async {
-    final account = _currentAccount();
-    if (account == null) {
-      return;
-    }
-    final updated = TotpAccount(
-      issuer: account.issuer,
-      account: account.account,
-      secret: account.secret,
-      userId: _userIdController.text.trim(),
-      rpId: _rpIdController.text.trim(),
-      deviceId: _deviceIdController.text.trim(),
-    );
-    await _store.save(updated.toRecord());
-    setState(() {
-      _selectedKey = _accountKey(updated);
-      _status = 'Account IDs updated.';
-    });
-  }
-
-  Future<void> _requestNonce() async {
-    final deviceId = _deviceIdController.text.trim();
-    final rpId = _rpIdController.text.trim();
-    if (deviceId.isEmpty || rpId.isEmpty) {
-      setState(() {
-        _status = 'Missing device_id or rp_id.';
-      });
-      return;
-    }
-    try {
-      final response = await widget.apiClient.postJson(
-        '/zt/challenge',
-        {'device_id': deviceId, 'rp_id': rpId},
-      );
-      if (response.statusCode == 200) {
-        final data = jsonDecode(response.body) as Map<String, dynamic>;
-        setState(() {
-          _nonce = data['nonce'] as String? ?? '';
-          _status = 'Nonce issued.';
-        });
-      } else {
-        setState(() {
-          _status = 'Challenge failed: ${response.body}';
-        });
-      }
-    } catch (error) {
-      setState(() {
-        _status = 'Error: $error';
-      });
-    }
-  }
-
-  Future<void> _submit() async {
-    final account = _currentAccount();
-    if (account == null) {
-      setState(() {
-        _status = 'No account selected.';
-      });
-      return;
-    }
-    if (_userIdController.text.trim().isEmpty ||
-        _rpIdController.text.trim().isEmpty ||
-        _deviceIdController.text.trim().isEmpty) {
-      setState(() {
-        _status = 'Missing user_id, rp_id, or device_id.';
-      });
-      return;
-    }
-    if (_nonce.isEmpty) {
-      setState(() {
-        _status = 'No nonce. Request a challenge first.';
-      });
-      return;
-    }
-
-    setState(() {
-      _loading = true;
-      _status = '';
-    });
-
-    try {
-      final otp = account.currentCode();
-      final signature = await _deviceCrypto.sign(
-        rpId: _rpIdController.text.trim(),
-        nonce: _nonce,
-        deviceId: _deviceIdController.text.trim(),
-        otp: otp,
-      );
-      if (signature.isEmpty) {
-        setState(() {
-          _status = 'Signature failed. Ensure device is enrolled.';
-        });
-        return;
-      }
-      final payload = {
-        'user_id': _userIdController.text.trim(),
-        'device_id': _deviceIdController.text.trim(),
-        'rp_id': _rpIdController.text.trim(),
-        'otp': otp,
-        'device_proof': {
-          'nonce': _nonce,
-          'signature': signature,
-        },
-      };
-      final response = await widget.apiClient.postJson('/zt/verify', payload);
-      setState(() {
-        _status = 'Status: ${response.statusCode}\n${response.body}';
-      });
-    } catch (error) {
-      setState(() {
-        _status = 'Error: $error';
-      });
-    } finally {
-      if (mounted) {
-        setState(() {
-          _loading = false;
-        });
-      }
-    }
-  }
-
-  Future<void> _debugProof() async {
-    final account = _currentAccount();
-    if (account == null) {
-      setState(() {
-        _status = 'No account selected.';
-      });
-      return;
-    }
-    if (_userIdController.text.trim().isEmpty ||
-        _rpIdController.text.trim().isEmpty ||
-        _deviceIdController.text.trim().isEmpty) {
-      setState(() {
-        _status = 'Missing user_id, rp_id, or device_id.';
-      });
-      return;
-    }
-    if (_nonce.isEmpty) {
-      setState(() {
-        _status = 'No nonce. Request a challenge first.';
-      });
-      return;
-    }
-
-    setState(() {
-      _loading = true;
-      _status = '';
-    });
-
-    try {
-      final otp = account.currentCode();
-      final signature = await _deviceCrypto.sign(
-        rpId: _rpIdController.text.trim(),
-        nonce: _nonce,
-        deviceId: _deviceIdController.text.trim(),
-        otp: otp,
-      );
-      final payload = {
-        'user_id': _userIdController.text.trim(),
-        'device_id': _deviceIdController.text.trim(),
-        'rp_id': _rpIdController.text.trim(),
-        'otp': otp,
-        'device_proof': {
-          'nonce': _nonce,
-          'signature': signature,
-        },
-      };
-      final response = await widget.apiClient.postJson('/zt/debug-proof', payload);
-      setState(() {
-        _status = 'Debug: ${response.statusCode}\n${response.body}';
-      });
-    } catch (error) {
-      setState(() {
-        _status = 'Error: $error';
-      });
-    } finally {
-      if (mounted) {
-        setState(() {
-          _loading = false;
-        });
-      }
-    }
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    final accounts = widget.accounts;
-
-    return Scaffold(
-      appBar: AppBar(
-        title: const Text('ZT Verify'),
-      ),
-      body: ListView(
-        padding: const EdgeInsets.all(16),
-        children: [
-          const _SectionHeader(
-            title: 'ZT-TOTP Verification',
-            subtitle: 'Uses server nonce + device-bound signature.',
-          ),
-          const SizedBox(height: 16),
-          DropdownButtonFormField<String>(
-            value: _selectedKey,
-            items: accounts
-                .map(
-                  (account) => DropdownMenuItem(
-                    value: _accountKey(account),
-                    child: Text('${account.issuer}: ${account.account}'),
-                  ),
-                )
-                .toList(),
-            onChanged: (value) {
-              setState(() {
-                _selectedKey = value;
-                _syncControllers();
-              });
-            },
-            decoration: const InputDecoration(
-              labelText: 'Account',
-            ),
-          ),
-          const SizedBox(height: 16),
-          _Field(label: 'User ID', controller: _userIdController),
-          _Field(label: 'RP ID', controller: _rpIdController),
-          _Field(label: 'Device ID', controller: _deviceIdController),
-          const SizedBox(height: 8),
-          ElevatedButton(
-            onPressed: _saveIds,
-            child: const Text('Save IDs'),
-          ),
-          const SizedBox(height: 16),
-          ElevatedButton(
-            onPressed: _requestNonce,
-            child: const Text('Request Nonce'),
-          ),
-          const SizedBox(height: 8),
-          if (_nonce.isNotEmpty)
-            Text('Nonce: $_nonce', style: const TextStyle(color: Colors.white70)),
-          const SizedBox(height: 16),
-          ElevatedButton(
-            onPressed: _loading ? null : _submit,
-            child: Text(_loading ? 'Submitting...' : 'ZT Verify Now'),
-          ),
-          const SizedBox(height: 8),
-          ElevatedButton(
-            onPressed: _loading ? null : _debugProof,
-            child: const Text('Debug Proof'),
-          ),
-          const SizedBox(height: 16),
-          Text(_status, style: const TextStyle(color: Colors.white70)),
         ],
       ),
     );
@@ -1165,14 +1623,14 @@ class _ZtVerifyScreenState extends State<ZtVerifyScreen> {
 class LoginApprovalsScreen extends StatefulWidget {
   const LoginApprovalsScreen({
     super.key,
-    required this.apiClient,
     required this.accounts,
     required this.deviceCrypto,
+    required this.allowInsecureTls,
   });
 
-  final ApiClient apiClient;
   final List<TotpAccount> accounts;
   final DeviceCrypto deviceCrypto;
+  final bool allowInsecureTls;
 
   @override
   State<LoginApprovalsScreen> createState() => _LoginApprovalsScreenState();
@@ -1200,6 +1658,54 @@ class _LoginApprovalsScreenState extends State<LoginApprovalsScreen> {
     return null;
   }
 
+  String _resolveAccountBaseUrl(TotpAccount account) {
+    if (account.apiBaseUrl.trim().isNotEmpty) {
+      return account.apiBaseUrl.trim();
+    }
+    if (account.rpId.trim().isNotEmpty) {
+      return 'https://${account.rpId.trim()}/api/auth';
+    }
+    return '';
+  }
+
+  Future<Map<String, dynamic>?> _accountGet(TotpAccount account, String path) async {
+    final baseUrl = _resolveAccountBaseUrl(account);
+    if (baseUrl.isEmpty) {
+      return null;
+    }
+    final client = ApiClient(baseUrl: baseUrl, allowInsecureTls: widget.allowInsecureTls);
+    try {
+      final response = await client.get(path);
+      if (response.statusCode != 200) {
+        return null;
+      }
+      return jsonDecode(response.body) as Map<String, dynamic>;
+    } finally {
+      client.close();
+    }
+  }
+
+  Future<Map<String, dynamic>?> _accountPost(
+    TotpAccount account,
+    String path,
+    Map<String, dynamic> payload,
+  ) async {
+    final baseUrl = _resolveAccountBaseUrl(account);
+    if (baseUrl.isEmpty) {
+      return null;
+    }
+    final client = ApiClient(baseUrl: baseUrl, allowInsecureTls: widget.allowInsecureTls);
+    try {
+      final response = await client.postJson(path, payload);
+      if (response.statusCode != 200) {
+        return null;
+      }
+      return jsonDecode(response.body) as Map<String, dynamic>;
+    } finally {
+      client.close();
+    }
+  }
+
   Future<void> _refresh() async {
     setState(() {
       _loading = true;
@@ -1210,13 +1716,10 @@ class _LoginApprovalsScreenState extends State<LoginApprovalsScreen> {
         if (account.userId.isEmpty) {
           continue;
         }
-        final response = await widget.apiClient.get(
-          '/login/pending?user_id=${account.userId}',
-        );
-        if (response.statusCode != 200) {
+        final data = await _accountGet(account, '/login/pending?user_id=${account.userId}');
+        if (data == null) {
           continue;
         }
-        final data = jsonDecode(response.body) as Map<String, dynamic>;
         if (data['status'] == 'pending') {
           setState(() {
             _pending = data;
@@ -1272,8 +1775,9 @@ class _LoginApprovalsScreenState extends State<LoginApprovalsScreen> {
         nonce: nonce,
         deviceId: account.deviceId,
         otp: otp,
+        keyId: account.keyId.isEmpty ? account.rpId : account.keyId,
       );
-      final response = await widget.apiClient.postJson('/login/approve', {
+      final response = await _accountPost(account, '/login/approve', {
         'login_id': loginId,
         'device_id': account.deviceId,
         'rp_id': account.rpId,
@@ -1282,7 +1786,7 @@ class _LoginApprovalsScreenState extends State<LoginApprovalsScreen> {
         'signature': signature,
       });
       setState(() {
-        _status = 'Approve: ${response.statusCode} ${response.body}';
+        _status = response == null ? 'Approve failed.' : 'Approve: ok';
       });
       await _refresh();
     } catch (error) {
@@ -1303,6 +1807,13 @@ class _LoginApprovalsScreenState extends State<LoginApprovalsScreen> {
     if (pending == null) {
       return;
     }
+    final account = _matchAccount(pending);
+    if (account == null) {
+      setState(() {
+        _status = 'No matching account for this login.';
+      });
+      return;
+    }
     final loginId = pending['login_id'] as String? ?? '';
     if (loginId.isEmpty) {
       return;
@@ -1312,12 +1823,12 @@ class _LoginApprovalsScreenState extends State<LoginApprovalsScreen> {
       _status = '';
     });
     try {
-      final response = await widget.apiClient.postJson('/login/deny', {
+      final response = await _accountPost(account, '/login/deny', {
         'login_id': loginId,
         'reason': 'user_denied',
       });
       setState(() {
-        _status = 'Denied: ${response.statusCode} ${response.body}';
+        _status = response == null ? 'Denied failed.' : 'Denied: ok';
       });
       await _refresh();
     } catch (error) {
@@ -1360,6 +1871,10 @@ class _LoginApprovalsScreenState extends State<LoginApprovalsScreen> {
               children: [
                 Expanded(
                   child: ElevatedButton(
+                    style: ElevatedButton.styleFrom(
+                      backgroundColor: Colors.redAccent,
+                      foregroundColor: Colors.white,
+                    ),
                     onPressed: _loading ? null : _deny,
                     child: const Text('Deny'),
                   ),
@@ -1367,6 +1882,10 @@ class _LoginApprovalsScreenState extends State<LoginApprovalsScreen> {
                 const SizedBox(width: 12),
                 Expanded(
                   child: ElevatedButton(
+                    style: ElevatedButton.styleFrom(
+                      backgroundColor: ZtIamColors.accentGreen,
+                      foregroundColor: Colors.white,
+                    ),
                     onPressed: _loading ? null : _approve,
                     child: const Text('Approve'),
                   ),
@@ -1382,268 +1901,6 @@ class _LoginApprovalsScreenState extends State<LoginApprovalsScreen> {
             child: const Text('Refresh'),
           ),
         ],
-      ),
-    );
-  }
-}
-
-class _VerifyScreenState extends State<VerifyScreen> {
-  String? _selectedKey;
-  String _status = '';
-  bool _loading = false;
-  final TotpStore _store = TotpStore();
-  final _userIdController = TextEditingController();
-  final _rpIdController = TextEditingController();
-  String _debug = '';
-
-  @override
-  void initState() {
-    super.initState();
-    if (widget.accounts.isNotEmpty) {
-      final first = widget.accounts.first;
-      _selectedKey = _accountKey(first);
-    }
-    _syncControllers();
-  }
-
-  void _syncControllers() {
-    final account = _currentAccount();
-    if (account == null) {
-      return;
-    }
-    _userIdController.text = account.userId;
-    _rpIdController.text = account.rpId;
-  }
-
-  TotpAccount? _currentAccount() {
-    final key = _selectedKey;
-    if (key == null) {
-      return null;
-    }
-    for (final account in widget.accounts) {
-      if (_accountKey(account) == key) {
-        return account;
-      }
-    }
-    return null;
-  }
-
-  String _accountKey(TotpAccount account) {
-    return '${account.issuer}|${account.account}';
-  }
-
-  @override
-  void dispose() {
-    _userIdController.dispose();
-    _rpIdController.dispose();
-    super.dispose();
-  }
-
-  Future<void> _saveIds() async {
-    final account = _currentAccount();
-    if (account == null) {
-      return;
-    }
-    final updated = TotpAccount(
-      issuer: account.issuer,
-      account: account.account,
-      secret: account.secret,
-      userId: _userIdController.text.trim(),
-      rpId: _rpIdController.text.trim(),
-      deviceId: account.deviceId,
-    );
-    await _store.save(updated.toRecord());
-    setState(() {
-      _selectedKey = _accountKey(updated);
-      _status = 'Account IDs updated.';
-    });
-  }
-
-  Future<void> _compareWithServer() async {
-    final account = _currentAccount();
-    if (account == null) {
-      setState(() {
-        _debug = 'No account selected.';
-      });
-      return;
-    }
-    final userId = _userIdController.text.trim();
-    final rpId = _rpIdController.text.trim();
-    if (userId.isEmpty || rpId.isEmpty) {
-      setState(() {
-        _debug = 'Missing user_id or rp_id.';
-      });
-      return;
-    }
-
-    final localSecret = account.secret.replaceAll(' ', '').toUpperCase();
-    try {
-      final response = await widget.apiClient.get(
-        '/totp/debug-state?user_id=$userId&rp_id=$rpId',
-      );
-      final serverData = jsonDecode(response.body) as Map<String, dynamic>;
-      final serverOtp = serverData['otp'] as String? ?? 'n/a';
-      final serverTime = serverData['server_time'] as int? ?? 0;
-      final localNow = DateTime.now().millisecondsSinceEpoch;
-      final localOtpNow = account.currentCode();
-      final localOtpAtServerTime = generateTotp(
-        localSecret,
-        timeMillis: serverTime * 1000,
-      );
-      final driftSeconds = (localNow ~/ 1000) - serverTime;
-
-      final secretResponse = await widget.apiClient.get(
-        '/totp/debug-secret?user_id=$userId&rp_id=$rpId',
-      );
-      final secretData =
-          jsonDecode(secretResponse.body) as Map<String, dynamic>;
-      final serverSecret =
-          (secretData['secret'] as String? ?? '').replaceAll(' ', '').toUpperCase();
-      final secretMatch = serverSecret == localSecret;
-
-      setState(() {
-        _debug = 'Local OTP: $localOtpNow\n'
-            'Local@ServerTime: $localOtpAtServerTime\n'
-            'Server OTP: $serverOtp\n'
-            'Drift (s): $driftSeconds\n'
-            'Secret match: $secretMatch';
-      });
-    } catch (error) {
-      setState(() {
-        _debug = 'Debug error: $error';
-      });
-    }
-  }
-
-  Future<void> _submit() async {
-    final account = _currentAccount();
-    if (account == null) {
-      setState(() {
-        _status = 'No account selected.';
-      });
-      return;
-    }
-    if (_userIdController.text.trim().isEmpty ||
-        _rpIdController.text.trim().isEmpty) {
-      setState(() {
-        _status = 'Missing user_id or rp_id for this account.';
-      });
-      return;
-    }
-
-    setState(() {
-      _loading = true;
-      _status = '';
-    });
-
-    final payload = {
-      'user_id': _userIdController.text.trim(),
-      'rp_id': _rpIdController.text.trim(),
-      'otp': account.currentCode(),
-    };
-
-    try {
-      final response = await widget.apiClient.postJson('/totp/verify', payload);
-      setState(() {
-        _status = 'Status: ${response.statusCode}\n${response.body}';
-      });
-    } catch (error) {
-      setState(() {
-        _status = 'Error: $error';
-      });
-    } finally {
-      if (mounted) {
-        setState(() {
-          _loading = false;
-        });
-      }
-    }
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    final accounts = widget.accounts;
-
-    return Scaffold(
-      appBar: AppBar(
-        title: const Text('Verify'),
-      ),
-      body: ListView(
-        padding: const EdgeInsets.all(16),
-        children: [
-          const _SectionHeader(
-            title: 'Verification Payload',
-            subtitle: 'Uses current code from the selected account.',
-          ),
-          const SizedBox(height: 16),
-          DropdownButtonFormField<String>(
-            value: _selectedKey,
-            items: accounts
-                .map(
-                  (account) => DropdownMenuItem(
-                    value: _accountKey(account),
-                    child: Text('${account.issuer}: ${account.account}'),
-                  ),
-                )
-                .toList(),
-            onChanged: (value) {
-              setState(() {
-                _selectedKey = value;
-                _syncControllers();
-              });
-            },
-            decoration: const InputDecoration(
-              labelText: 'Account',
-            ),
-          ),
-          const SizedBox(height: 16),
-          _Field(label: 'User ID', controller: _userIdController),
-          _Field(label: 'RP ID', controller: _rpIdController),
-          const SizedBox(height: 8),
-          ElevatedButton(
-            onPressed: _saveIds,
-            child: const Text('Save IDs'),
-          ),
-          const SizedBox(height: 16),
-          ElevatedButton(
-            onPressed: _compareWithServer,
-            child: const Text('Compare With Server'),
-          ),
-          const SizedBox(height: 16),
-          ElevatedButton(
-            onPressed: _loading ? null : _submit,
-            child: Text(_loading ? 'Submitting...' : 'Verify Now'),
-          ),
-          const SizedBox(height: 16),
-          Text(_status, style: const TextStyle(color: Colors.white70)),
-          if (_debug.isNotEmpty) ...[
-            const SizedBox(height: 12),
-            Text(_debug, style: const TextStyle(color: Colors.white70)),
-          ],
-        ],
-      ),
-    );
-  }
-}
-
-// Consistent form field styling.
-class _Field extends StatelessWidget {
-  const _Field({required this.label, required this.controller});
-
-  final String label;
-  final TextEditingController controller;
-
-  @override
-  Widget build(BuildContext context) {
-    return Padding(
-      padding: const EdgeInsets.only(bottom: 12),
-      child: TextField(
-        controller: controller,
-        decoration: InputDecoration(
-          labelText: label,
-          filled: true,
-          fillColor: const Color(0xFF1F1F1F),
-        ),
       ),
     );
   }

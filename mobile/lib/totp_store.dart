@@ -10,6 +10,8 @@ class TotpRecord {
     required this.userId,
     required this.rpId,
     required this.deviceId,
+    required this.apiBaseUrl,
+    required this.keyId,
   });
 
   final String issuer;
@@ -18,6 +20,8 @@ class TotpRecord {
   final String userId;
   final String rpId;
   final String deviceId;
+  final String apiBaseUrl;
+  final String keyId;
 
   TotpRecord normalized() {
     return TotpRecord(
@@ -27,6 +31,8 @@ class TotpRecord {
       userId: userId,
       rpId: rpId,
       deviceId: deviceId,
+      apiBaseUrl: apiBaseUrl,
+      keyId: keyId,
     );
   }
 
@@ -38,6 +44,8 @@ class TotpRecord {
       'user_id': userId,
       'rp_id': rpId,
       'device_id': deviceId,
+      'api_base_url': apiBaseUrl,
+      'key_id': keyId,
     };
   }
 
@@ -49,6 +57,8 @@ class TotpRecord {
       userId: json['user_id'] as String? ?? '',
       rpId: json['rp_id'] as String? ?? '',
       deviceId: json['device_id'] as String? ?? '',
+      apiBaseUrl: json['api_base_url'] as String? ?? '',
+      keyId: json['key_id'] as String? ?? '',
     );
   }
 }
@@ -85,6 +95,8 @@ class TotpStore {
             userId: '',
             rpId: '',
             deviceId: '',
+            apiBaseUrl: '',
+            keyId: '',
           ),
         );
       }
@@ -96,6 +108,11 @@ class TotpStore {
   Future<void> save(TotpRecord record) async {
     final key = '$_prefix${record.issuer}|${record.account}';
     await _storage.write(key: key, value: jsonEncode(record.normalized().toJson()));
+  }
+
+  Future<void> delete(TotpRecord record) async {
+    final key = '$_prefix${record.issuer}|${record.account}';
+    await _storage.delete(key: key);
   }
 
   Future<void> clearAll() async {

@@ -13,11 +13,13 @@ ZT-Authenticator while keeping standard TOTP behavior unchanged.
 1) **Enrollment QR generation**
    - Generate a QR containing the JSON payload below.
    - Show it to the user during setup.
+   - Include `api_base_url` so each account routes to the correct backend (multi-tenant).
 
 ```
 {
   "type": "zt_totp_enroll",
   "rp_id": "example.com",
+  "api_base_url": "https://auth.example.com/api/auth",
   "rp_display_name": "Example RP",
   "email": "alice@example.com",
   "issuer": "Example",

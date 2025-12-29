@@ -1,5 +1,8 @@
 import argparse
+import base64
 import csv
+import json
+import ssl
 import time
 import uuid
 from dataclasses import dataclass
@@ -20,7 +23,7 @@ class Enrollment:
     private_key: Ed25519PrivateKey
 
 
-def post_json(base_url: str, path: str, payload: dict) -> dict:
+def post_json(base_url: str, path: str, payload: dict, context: ssl.SSLContext | None) -> dict:
     data = json.dumps(payload).encode("utf-8")
     req = request.Request(
         f"{base_url}{path}",
@@ -28,7 +31,7 @@ def post_json(base_url: str, path: str, payload: dict) -> dict:
         headers={"Content-Type": "application/json"},
         method="POST",
     )
-    with request.urlopen(req, timeout=10) as resp:
+    with request.urlopen(req, timeout=10, context=context) as resp:
         return json.loads(resp.read().decode("utf-8"))
 
 
@@ -43,7 +46,7 @@ def generate_keypair() -> Tuple[Ed25519PrivateKey, str]:
     return private_key, public_b64
 
 
-def enroll(base_url: str, email: str, rp_id: str) -> Enrollment:
+def enroll(base_url: str, email: str, rp_id: str, context: ssl.SSLContext | None) -> Enrollment:
     private_key, public_b64 = generate_keypair()
     enroll_resp = post_json(
         base_url,
@@ -57,6 +60,7 @@ def enroll(base_url: str, email: str, rp_id: str) -> Enrollment:
             "key_type": "ed25519",
             "public_key": public_b64,
         },
+        context,
     )
     user_id = enroll_resp["user"]["id"]
     device_id = enroll_resp["device"]["id"]
@@ -70,6 +74,7 @@ def enroll(base_url: str, email: str, rp_id: str) -> Enrollment:
             "account_name": email,
             "issuer": "FRR",
         },
+        context,
     )
     otpauth_uri = register_resp["otpauth_uri"]
     parsed = parse.urlparse(otpauth_uri)
@@ -89,20 +94,22 @@ def otp_with_drift(secret: str, drift_seconds: int) -> str:
     return pyotp.TOTP(secret).at(now - drift_seconds)
 
 
-def totp_verify(base_url: str, enrollment: Enrollment, otp: str) -> bool:
+def totp_verify(base_url: str, enrollment: Enrollment, otp: str, context: ssl.SSLContext | None) -> bool:
     resp = post_json(
         base_url,
         "/totp/verify",
         {"user_id": enrollment.user_id, "rp_id": enrollment.rp_id, "otp": otp},
+        context,
     )
     return resp.get("status") == "ok"
 
 
-def zt_verify(base_url: str, enrollment: Enrollment, otp: str) -> bool:
+def zt_verify(base_url: str, enrollment: Enrollment, otp: str, context: ssl.SSLContext | None) -> bool:
     challenge = post_json(
         base_url,
         "/zt/challenge",
         {"device_id": enrollment.device_id, "rp_id": enrollment.rp_id},
+        context,
     )
     nonce = challenge["nonce"]
     message = f"{nonce}|{enrollment.device_id}|{enrollment.rp_id}|{otp}".encode("utf-8")
@@ -117,13 +124,15 @@ def zt_verify(base_url: str, enrollment: Enrollment, otp: str) -> bool:
             "otp": otp,
             "device_proof": {"nonce": nonce, "signature": signature},
         },
+        context,
     )
     return resp.get("status") == "ok"
 
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--base-url", default="http://localhost:8000")
+    parser.add_argument("--base-url", default="https://localhost:8000")
+    parser.add_argument("--insecure", action="store_true", help="Disable TLS verification (dev only).")
     parser.add_argument("--trials", type=int, default=30)
     parser.add_argument("--drifts", default="0,15,30,60,90,120")
     parser.add_argument("--output", default="experiments/frr_sweep.csv")
@@ -135,7 +144,8 @@ def main() -> None:
     run_id = uuid.uuid4().hex[:8]
     email = f"frr-{run_id}@example.com"
     rp_id = f"frr-{run_id}.com"
-    enrollment = enroll(base_url, email, rp_id)
+    context = ssl._create_unverified_context() if args.insecure else None
+    enrollment = enroll(base_url, email, rp_id, context)
 
     rows = []
     for drift in drifts:
@@ -143,9 +153,9 @@ def main() -> None:
         ok_zt = 0
         for _ in range(args.trials):
             otp = otp_with_drift(enrollment.secret, drift)
-            if totp_verify(base_url, enrollment, otp):
+            if totp_verify(base_url, enrollment, otp, context):
                 ok_totp += 1
-            if zt_verify(base_url, enrollment, otp):
+            if zt_verify(base_url, enrollment, otp, context):
                 ok_zt += 1
         rows.append((drift, ok_totp, ok_zt, args.trials))
 
@@ -159,6 +169,4 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    import base64
-    import json
     main()

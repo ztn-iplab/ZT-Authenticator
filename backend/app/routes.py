@@ -38,8 +38,6 @@ from app.verification import (
     LoginResponse,
     LoginStartResponse,
     LoginStatusResponse,
-    VerifyRequest,
-    VerifyResponse,
 )
 from app.zt_models import (
     ChallengeRequest,
@@ -62,6 +60,8 @@ from app.models import (
     DeviceKeyCreate,
     DeviceKeyOut,
     DeviceOut,
+    FeedbackRequest,
+    FeedbackResponse,
     RelyingPartyCreate,
     RelyingPartyOut,
     UserCreate,
@@ -81,6 +81,18 @@ from time import monotonic
 
 router = APIRouter()
 logger = logging.getLogger("app.audit")
+
+
+@router.post("/feedback", response_model=FeedbackResponse)
+async def submit_feedback(payload: FeedbackRequest, request: Request) -> FeedbackResponse:
+    logger.info(
+        "feedback received category=%s source=%s message_len=%s client=%s",
+        payload.category,
+        payload.source,
+        len(payload.message),
+        request.client.host if request.client else "unknown",
+    )
+    return FeedbackResponse(status="received")
 
 
 @router.post("/users", response_model=UserOut)
@@ -131,12 +143,6 @@ async def enroll_device(payload: EnrollmentRequest) -> EnrollmentResponse:
         return await enroll(payload)
     except UniqueViolationError:
         raise HTTPException(status_code=409, detail="enrollment conflict")
-
-
-@router.post("/verify", response_model=VerifyResponse)
-async def verify(payload: VerifyRequest) -> VerifyResponse:
-    # Placeholder until ZT-TOTP verification is implemented.
-    raise HTTPException(status_code=501, detail="verification not implemented yet")
 
 
 @router.post("/login", response_model=LoginStartResponse)
