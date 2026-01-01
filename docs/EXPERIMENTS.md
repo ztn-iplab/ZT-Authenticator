@@ -1,16 +1,16 @@
 # ZT-TOTP Data Collection Guide
 
-This guide provides repeatable steps to generate data for the paper tables.
+This guide provides repeatable steps to generate research data for this project.
 
 ## What gets measured
 
-**Table I (success rates)**:
+**success rates**:
 - Legitimate login
 - Seed compromise
 - Relay phishing
 - Offline degraded
 
-**Table II (latency)**:
+**latency)**:
 - Standard TOTP (`/totp/verify`)
 - ZT-TOTP (`/zt/challenge` + `/zt/verify`)
 
