@@ -51,7 +51,6 @@ class _HomeScreenState extends State<HomeScreen> {
   String _searchQuery = '';
   bool _allowInsecureTls = false;
   bool _allowHttpDev = false;
-  String _feedbackUrl = '';
   String _fallbackApiBaseUrl = '';
   final TotpStore _store = TotpStore();
   final List<TotpAccount> _totpAccounts = [];
@@ -88,7 +87,6 @@ class _HomeScreenState extends State<HomeScreen> {
     final loginPollingEnabled = await _settings.loadLoginPollingEnabled();
     final allowInsecureTls = await _settings.loadAllowInsecureTls();
     final allowHttpDev = await _settings.loadAllowHttpDev();
-    final feedbackUrl = await _settings.loadFeedbackUrl();
     if (!mounted) {
       return;
     }
@@ -97,7 +95,6 @@ class _HomeScreenState extends State<HomeScreen> {
       _allowInsecureTls = allowInsecureTls;
       _allowHttpDev = allowHttpDev;
       _fallbackApiBaseUrl = storedBaseUrl ?? '';
-      _feedbackUrl = feedbackUrl ?? '';
     });
     _restartLoginPoller();
   }
@@ -327,14 +324,6 @@ class _HomeScreenState extends State<HomeScreen> {
   }
 
   String _resolveFeedbackBaseUrl() {
-    if (_feedbackUrl.trim().isNotEmpty) {
-      final raw = _feedbackUrl.trim();
-      final uri = Uri.tryParse(raw);
-      if (_allowHttpDev && uri != null && _isLocalHost(uri.host)) {
-        return uri.replace(scheme: 'http').toString();
-      }
-      return raw;
-    }
     return _totpAccounts
         .map(_resolveAccountBaseUrl)
         .firstWhere((value) => value.isNotEmpty, orElse: () => _fallbackApiBaseUrl);
@@ -611,7 +600,6 @@ class _HomeScreenState extends State<HomeScreen> {
                 initialLoginPolling: _loginPollingEnabled,
                 initialAllowInsecureTls: _allowInsecureTls,
                 initialAllowHttpDev: _allowHttpDev,
-                initialFeedbackUrl: _feedbackUrl,
                 settings: _settings,
               ),
             ),
@@ -623,7 +611,6 @@ class _HomeScreenState extends State<HomeScreen> {
             _loginPollingEnabled = result.loginPolling;
             _allowInsecureTls = result.allowInsecureTls;
             _allowHttpDev = result.allowHttpDev;
-            _feedbackUrl = result.feedbackUrl ?? '';
           });
           _restartLoginPoller();
         },

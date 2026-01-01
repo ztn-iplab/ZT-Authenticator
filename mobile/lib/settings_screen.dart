@@ -8,13 +8,11 @@ class SettingsResult {
     required this.loginPolling,
     required this.allowInsecureTls,
     required this.allowHttpDev,
-    required this.feedbackUrl,
   });
 
   final bool loginPolling;
   final bool allowInsecureTls;
   final bool allowHttpDev;
-  final String? feedbackUrl;
 }
 
 class SettingsScreen extends StatefulWidget {
@@ -23,14 +21,12 @@ class SettingsScreen extends StatefulWidget {
     required this.initialLoginPolling,
     required this.initialAllowInsecureTls,
     required this.initialAllowHttpDev,
-    required this.initialFeedbackUrl,
     required this.settings,
   });
 
   final bool initialLoginPolling;
   final bool initialAllowInsecureTls;
   final bool initialAllowHttpDev;
-  final String? initialFeedbackUrl;
   final AppSettings settings;
 
   @override
@@ -41,7 +37,6 @@ class _SettingsScreenState extends State<SettingsScreen> {
   bool _loginPolling = true;
   bool _allowInsecureTls = false;
   bool _allowHttpDev = false;
-  late final TextEditingController _feedbackController;
   String _status = '';
   bool _saving = false;
 
@@ -51,13 +46,6 @@ class _SettingsScreenState extends State<SettingsScreen> {
     _loginPolling = widget.initialLoginPolling;
     _allowInsecureTls = widget.initialAllowInsecureTls;
     _allowHttpDev = widget.initialAllowHttpDev;
-    _feedbackController = TextEditingController(text: widget.initialFeedbackUrl ?? '');
-  }
-
-  @override
-  void dispose() {
-    _feedbackController.dispose();
-    super.dispose();
   }
 
   Future<void> _save() async {
@@ -68,7 +56,6 @@ class _SettingsScreenState extends State<SettingsScreen> {
     await widget.settings.saveLoginPollingEnabled(_loginPolling);
     await widget.settings.saveAllowInsecureTls(_allowInsecureTls);
     await widget.settings.saveAllowHttpDev(_allowHttpDev);
-    await widget.settings.saveFeedbackUrl(_feedbackController.text);
     if (!mounted) {
       return;
     }
@@ -77,9 +64,6 @@ class _SettingsScreenState extends State<SettingsScreen> {
         loginPolling: _loginPolling,
         allowInsecureTls: _allowInsecureTls,
         allowHttpDev: _allowHttpDev,
-        feedbackUrl: _feedbackController.text.trim().isEmpty
-            ? null
-            : _feedbackController.text.trim(),
       ),
     );
   }
@@ -119,23 +103,6 @@ class _SettingsScreenState extends State<SettingsScreen> {
               title: const Text('Allow HTTP for local testing'),
               subtitle: const Text('Use only when HTTPS is unavailable on LAN.'),
               onChanged: (value) => setState(() => _allowHttpDev = value),
-            ),
-            const SizedBox(height: 12),
-            const Text(
-              'Feedback',
-              style: TextStyle(
-                color: ZtIamColors.textPrimary,
-                fontSize: 16,
-                fontWeight: FontWeight.w600,
-              ),
-            ),
-            const SizedBox(height: 8),
-            TextField(
-              controller: _feedbackController,
-              decoration: const InputDecoration(
-                labelText: 'Feedback endpoint (optional)',
-                hintText: 'http://<host-ip>:5055',
-              ),
             ),
             const SizedBox(height: 16),
             ElevatedButton(
