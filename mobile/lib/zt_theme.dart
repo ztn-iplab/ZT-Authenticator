@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import 'package:google_fonts/google_fonts.dart';
 
 class ZtIamColors {
   static const Color background = Color(0xFF1C1C3A);
@@ -25,6 +26,7 @@ class ZtIamColors {
 }
 
 ThemeData ztIamTheme() {
+  final base = ThemeData.dark();
   return ThemeData(
     brightness: Brightness.dark,
     scaffoldBackgroundColor: ZtIamColors.background,
@@ -41,6 +43,14 @@ ThemeData ztIamTheme() {
       backgroundColor: ZtIamColors.background,
       foregroundColor: ZtIamColors.textPrimary,
       elevation: 0,
+    ),
+    textTheme: GoogleFonts.spaceGroteskTextTheme(base.textTheme).apply(
+      bodyColor: ZtIamColors.textPrimary,
+      displayColor: ZtIamColors.textPrimary,
+    ),
+    primaryTextTheme: GoogleFonts.spaceGroteskTextTheme(base.primaryTextTheme).apply(
+      bodyColor: ZtIamColors.textPrimary,
+      displayColor: ZtIamColors.textPrimary,
     ),
     inputDecorationTheme: InputDecorationTheme(
       filled: true,

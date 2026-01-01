@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:math' as math;
 import 'dart:io';
 
 import 'package:flutter/material.dart';
@@ -46,7 +47,11 @@ class HomeScreen extends StatefulWidget {
 
 class _HomeScreenState extends State<HomeScreen> {
   final AppSettings _settings = AppSettings();
+  final TextEditingController _searchController = TextEditingController();
+  String _searchQuery = '';
   bool _allowInsecureTls = false;
+  bool _allowHttpDev = false;
+  String _feedbackUrl = '';
   String _fallbackApiBaseUrl = '';
   final TotpStore _store = TotpStore();
   final List<TotpAccount> _totpAccounts = [];
@@ -61,6 +66,15 @@ class _HomeScreenState extends State<HomeScreen> {
   void initState() {
     super.initState();
     _loadAccounts();
+    _searchController.addListener(() {
+      final next = _searchController.text.trim();
+      if (next == _searchQuery) {
+        return;
+      }
+      setState(() {
+        _searchQuery = next;
+      });
+    });
     _ticker = Timer.periodic(const Duration(seconds: 1), (_) {
       if (mounted) {
         setState(() {});
@@ -73,13 +87,17 @@ class _HomeScreenState extends State<HomeScreen> {
     final storedBaseUrl = await _settings.loadApiBaseUrl();
     final loginPollingEnabled = await _settings.loadLoginPollingEnabled();
     final allowInsecureTls = await _settings.loadAllowInsecureTls();
+    final allowHttpDev = await _settings.loadAllowHttpDev();
+    final feedbackUrl = await _settings.loadFeedbackUrl();
     if (!mounted) {
       return;
     }
     setState(() {
       _loginPollingEnabled = loginPollingEnabled;
       _allowInsecureTls = allowInsecureTls;
+      _allowHttpDev = allowHttpDev;
       _fallbackApiBaseUrl = storedBaseUrl ?? '';
+      _feedbackUrl = feedbackUrl ?? '';
     });
     _restartLoginPoller();
   }
@@ -108,6 +126,7 @@ class _HomeScreenState extends State<HomeScreen> {
   void dispose() {
     _ticker?.cancel();
     _loginPoller?.cancel();
+    _searchController.dispose();
     super.dispose();
   }
 
@@ -281,14 +300,44 @@ class _HomeScreenState extends State<HomeScreen> {
     return localPart[0].toUpperCase();
   }
 
+  bool _isLocalHost(String host) {
+    return host == 'localhost' ||
+        host == '127.0.0.1' ||
+        RegExp(r'^[0-9.]+$').hasMatch(host) ||
+        host.endsWith('.local') ||
+        host.endsWith('.localdomain.com');
+  }
+
   String _resolveAccountBaseUrl(TotpAccount account) {
     if (account.apiBaseUrl.trim().isNotEmpty) {
-      return account.apiBaseUrl.trim();
+      final raw = account.apiBaseUrl.trim();
+      final uri = Uri.tryParse(raw);
+      if (_allowHttpDev && uri != null && _isLocalHost(uri.host)) {
+        return uri.replace(scheme: 'http').toString();
+      }
+      return raw;
     }
     if (account.rpId.trim().isNotEmpty) {
-      return 'https://${account.rpId.trim()}/api/auth';
+      final scheme = _allowHttpDev && _isLocalHost(account.rpId.trim())
+          ? 'http'
+          : 'https';
+      return '$scheme://${account.rpId.trim()}/api/auth';
     }
     return '';
+  }
+
+  String _resolveFeedbackBaseUrl() {
+    if (_feedbackUrl.trim().isNotEmpty) {
+      final raw = _feedbackUrl.trim();
+      final uri = Uri.tryParse(raw);
+      if (_allowHttpDev && uri != null && _isLocalHost(uri.host)) {
+        return uri.replace(scheme: 'http').toString();
+      }
+      return raw;
+    }
+    return _totpAccounts
+        .map(_resolveAccountBaseUrl)
+        .firstWhere((value) => value.isNotEmpty, orElse: () => _fallbackApiBaseUrl);
   }
 
   Future<Map<String, dynamic>?> _accountGet(
@@ -519,6 +568,7 @@ class _HomeScreenState extends State<HomeScreen> {
   @override
   Widget build(BuildContext context) {
     final accounts = List<TotpAccount>.from(_totpAccounts);
+    final filteredAccounts = _filterAccounts(accounts);
     final profileInitial = _profileInitial(accounts);
 
     return Scaffold(
@@ -560,6 +610,8 @@ class _HomeScreenState extends State<HomeScreen> {
               builder: (_) => SettingsScreen(
                 initialLoginPolling: _loginPollingEnabled,
                 initialAllowInsecureTls: _allowInsecureTls,
+                initialAllowHttpDev: _allowHttpDev,
+                initialFeedbackUrl: _feedbackUrl,
                 settings: _settings,
               ),
             ),
@@ -570,13 +622,13 @@ class _HomeScreenState extends State<HomeScreen> {
           setState(() {
             _loginPollingEnabled = result.loginPolling;
             _allowInsecureTls = result.allowInsecureTls;
+            _allowHttpDev = result.allowHttpDev;
+            _feedbackUrl = result.feedbackUrl ?? '';
           });
           _restartLoginPoller();
         },
         onSendFeedback: () {
-          final baseUrl = _totpAccounts
-              .map(_resolveAccountBaseUrl)
-              .firstWhere((value) => value.isNotEmpty, orElse: () => _fallbackApiBaseUrl);
+          final baseUrl = _resolveFeedbackBaseUrl();
           if (baseUrl.isEmpty) {
             ScaffoldMessenger.of(context).showSnackBar(
               const SnackBar(content: Text('No server available for feedback.')),
@@ -606,16 +658,35 @@ class _HomeScreenState extends State<HomeScreen> {
           padding: const EdgeInsets.all(16),
           children: [
             TextField(
-              decoration: const InputDecoration(
-                hintText: 'Search...',
-                prefixIcon: Icon(Icons.search),
+              controller: _searchController,
+              decoration: InputDecoration(
+                hintText: 'Search',
+                prefixIcon: const Icon(Icons.search),
+                suffixIcon: _searchQuery.isEmpty
+                    ? null
+                    : IconButton(
+                        icon: const Icon(Icons.clear),
+                        onPressed: () {
+                          _searchController.clear();
+                        },
+                      ),
               ),
             ),
             const SizedBox(height: 16),
             if (accounts.isEmpty)
               const _EmptyState()
+            else if (filteredAccounts.isEmpty)
+              const Padding(
+                padding: EdgeInsets.symmetric(vertical: 24),
+                child: Center(
+                  child: Text(
+                    'No matching accounts found.',
+                    style: TextStyle(color: Colors.white70),
+                  ),
+                ),
+              )
             else
-              ...accounts.map(
+              ...filteredAccounts.map(
                 (entry) => _AccountRow(
                   entry: entry,
                   onEdit: () => _editAccount(entry),
@@ -630,6 +701,21 @@ class _HomeScreenState extends State<HomeScreen> {
         child: const Icon(Icons.add),
       ),
     );
+  }
+
+  List<TotpAccount> _filterAccounts(List<TotpAccount> accounts) {
+    final query = _searchQuery.trim().toLowerCase();
+    if (query.isEmpty) {
+      return accounts;
+    }
+    return accounts.where((entry) {
+      final issuer = entry.displayIssuer().toLowerCase();
+      final account = entry.account.toLowerCase();
+      final rpId = entry.rpId.toLowerCase();
+      return issuer.contains(query) ||
+          account.contains(query) ||
+          rpId.contains(query);
+    }).toList();
   }
 }
 
@@ -793,10 +879,9 @@ class _AccountTile extends StatelessWidget {
     final progress = entry.progress();
     final issuer = entry.displayIssuer();
     final account = entry.account.trim();
-    final header = account.isEmpty ? issuer : '$issuer:$account';
 
     return Padding(
-      padding: const EdgeInsets.only(bottom: 8),
+      padding: const EdgeInsets.only(bottom: 4),
       child: Row(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
@@ -804,17 +889,44 @@ class _AccountTile extends StatelessWidget {
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                Text(
-                  header,
-                  style: const TextStyle(
-                    fontSize: 15,
-                    fontWeight: FontWeight.w600,
-                    color: Colors.white,
-                  ),
-                  maxLines: 1,
-                  overflow: TextOverflow.ellipsis,
+                Row(
+                  children: [
+                    Flexible(
+                      flex: 0,
+                      child: Text(
+                        issuer,
+                        style: const TextStyle(
+                          fontSize: 14,
+                          fontWeight: FontWeight.w600,
+                          color: Colors.white,
+                        ),
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                      ),
+                    ),
+                    if (account.isNotEmpty) ...[
+                      const SizedBox(width: 6),
+                      const Text(
+                        '•',
+                        style: TextStyle(color: Colors.white54, fontSize: 12),
+                      ),
+                      const SizedBox(width: 6),
+                      Expanded(
+                        child: Text(
+                          account,
+                          style: const TextStyle(
+                            fontSize: 12,
+                            color: Colors.white70,
+                            fontWeight: FontWeight.w500,
+                          ),
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                        ),
+                      ),
+                    ],
+                  ],
                 ),
-                const SizedBox(height: 8),
+                const SizedBox(height: 6),
                 GestureDetector(
                   onLongPress: () async {
                     await Clipboard.setData(ClipboardData(text: code));
@@ -827,9 +939,10 @@ class _AccountTile extends StatelessWidget {
                   child: Text(
                     _formatCode(code),
                     style: const TextStyle(
-                      fontSize: 32,
-                      letterSpacing: 2,
+                      fontSize: 28,
+                      letterSpacing: 2.2,
                       color: ZtIamColors.accentSoft,
+                      fontWeight: FontWeight.w600,
                     ),
                   ),
                 ),
@@ -838,16 +951,48 @@ class _AccountTile extends StatelessWidget {
             ),
           ),
           const SizedBox(width: 12),
-          SizedBox(
-            width: 36,
-            height: 36,
+          _ProgressRing(progress: progress),
+        ],
+      ),
+    );
+  }
+}
+
+class _ProgressRing extends StatelessWidget {
+  const _ProgressRing({
+    required this.progress,
+  });
+
+  final double progress;
+
+  @override
+  Widget build(BuildContext context) {
+    return SizedBox(
+      width: 46,
+      height: 46,
+      child: Stack(
+        alignment: Alignment.center,
+        children: [
+          ShaderMask(
+            shaderCallback: (rect) {
+              return SweepGradient(
+                startAngle: -math.pi / 2,
+                endAngle: math.pi * 1.5,
+                colors: const [
+                  ZtIamColors.accentBlue,
+                  ZtIamColors.accentSoftMuted,
+                ],
+              ).createShader(rect);
+            },
             child: CircularProgressIndicator(
               value: progress,
               strokeWidth: 4,
-              color: ZtIamColors.accentSoftMuted,
               backgroundColor: ZtIamColors.divider,
+              valueColor: const AlwaysStoppedAnimation<Color>(Colors.white),
+              strokeCap: StrokeCap.round,
             ),
           ),
+          const SizedBox.shrink(),
         ],
       ),
     );
@@ -1039,6 +1184,7 @@ class _TotpSetupScreenState extends State<TotpSetupScreen> {
   String _detectedBaseUrl = '';
   String _connectivityHint = '';
   bool _allowInsecureTls = false;
+  bool _allowHttpDev = false;
   String _lastEmail = '';
   String _lastRpId = '';
   String _lastIssuer = '';
@@ -1084,7 +1230,7 @@ class _TotpSetupScreenState extends State<TotpSetupScreen> {
   void initState() {
     super.initState();
     _loadPendingEnrollment();
-    _loadTlsSetting();
+    _loadNetworkSettings();
   }
 
   Future<void> _loadPendingEnrollment() async {
@@ -1105,13 +1251,15 @@ class _TotpSetupScreenState extends State<TotpSetupScreen> {
     }
   }
 
-  Future<void> _loadTlsSetting() async {
+  Future<void> _loadNetworkSettings() async {
     final allowInsecureTls = await _settings.loadAllowInsecureTls();
+    final allowHttpDev = await _settings.loadAllowHttpDev();
     if (!mounted) {
       return;
     }
     setState(() {
       _allowInsecureTls = allowInsecureTls;
+      _allowHttpDev = allowHttpDev;
     });
   }
 
@@ -1125,22 +1273,33 @@ class _TotpSetupScreenState extends State<TotpSetupScreen> {
       if (cleaned.startsWith('http://') || cleaned.startsWith('https://')) {
         return _normalizeBaseUrl(cleaned);
       }
-      return _normalizeBaseUrl('https://$cleaned');
+      return _normalizeBaseUrl('${_defaultScheme(cleaned)}://$cleaned');
     }
     final rpId = (payload['rp_id'] as String?)?.trim() ?? '';
     if (rpId.isEmpty) {
       return '';
     }
-    return _normalizeBaseUrl('https://$rpId/api/auth');
+    return _normalizeBaseUrl('${_defaultScheme(rpId)}://$rpId/api/auth');
+  }
+
+  String _defaultScheme(String host) {
+    final lowered = host.toLowerCase();
+    if (_allowHttpDev && _isLocalAddress(lowered)) {
+      return 'http';
+    }
+    return 'https';
   }
 
   String _normalizeBaseUrl(String value) {
     try {
       final cleaned = _stripWhitespace(value);
       final uri = Uri.parse(cleaned);
-      final scheme = uri.scheme.isEmpty || uri.scheme == 'http' ? 'https' : uri.scheme;
+      var scheme = uri.scheme.isEmpty ? 'https' : uri.scheme;
       final host = uri.host.isEmpty ? uri.path : uri.host;
       final port = uri.hasPort ? ':${uri.port}' : '';
+      if (_allowHttpDev && _isLocalAddress(host)) {
+        scheme = 'http';
+      }
       final path = uri.path;
       if (path.contains('/api/auth')) {
         return '$scheme://$host$port/api/auth';
@@ -1314,11 +1473,15 @@ class _TotpSetupScreenState extends State<TotpSetupScreen> {
     });
   }
 
-  bool _isLocalhostHost(String host) {
+  bool _isLoopbackHost(String host) {
     return host == 'localhost' ||
         host == '127.0.0.1' ||
         host.endsWith('.local') ||
         host.endsWith('.localdomain.com');
+  }
+
+  bool _isLocalAddress(String host) {
+    return _isLoopbackHost(host) || RegExp(r'^[0-9.]+$').hasMatch(host);
   }
 
   String _buildKeyId(String rpId, String email) {
@@ -1359,7 +1522,7 @@ class _TotpSetupScreenState extends State<TotpSetupScreen> {
         _detectedBaseUrl = detectedBaseUrl;
         if (detectedBaseUrl.isNotEmpty) {
           final host = Uri.tryParse(detectedBaseUrl)?.host ?? '';
-          _connectivityHint = _isLocalhostHost(host)
+          _connectivityHint = _isLoopbackHost(host)
               ? 'Tip: use a LAN IP or tunnel URL for mobile devices.'
               : '';
         }
@@ -1542,6 +1705,19 @@ class _TotpSetupScreenState extends State<TotpSetupScreen> {
                               }
                             },
                       child: const Text('Retry enrollment'),
+                    ),
+                    const SizedBox(height: 8),
+                    TextButton(
+                      onPressed: _loading
+                          ? null
+                          : () async {
+                              await _settings.clearPendingEnrollment();
+                              setState(() {
+                                _pendingPayload = null;
+                                _status = 'Pending enrollment cleared.';
+                              });
+                            },
+                      child: const Text('Clear pending enrollment'),
                     ),
                   ],
                 ),

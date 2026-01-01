@@ -6,6 +6,8 @@ class AppSettings {
   static const _loginPollingKey = 'settings:login_polling';
   static const _pendingEnrollmentKey = 'settings:pending_enrollment';
   static const _allowInsecureKey = 'settings:allow_insecure_tls';
+  static const _allowHttpDevKey = 'settings:allow_http_dev';
+  static const _feedbackUrlKey = 'settings:feedback_url';
 
   Future<String?> loadApiBaseUrl() async {
     final value = await _storage.read(key: _apiBaseUrlKey);
@@ -45,6 +47,34 @@ class AppSettings {
 
   Future<void> saveAllowInsecureTls(bool enabled) async {
     await _storage.write(key: _allowInsecureKey, value: enabled.toString());
+  }
+
+  Future<bool> loadAllowHttpDev() async {
+    final value = await _storage.read(key: _allowHttpDevKey);
+    if (value == null) {
+      return false;
+    }
+    return value.toLowerCase() == 'true';
+  }
+
+  Future<void> saveAllowHttpDev(bool enabled) async {
+    await _storage.write(key: _allowHttpDevKey, value: enabled.toString());
+  }
+
+  Future<String?> loadFeedbackUrl() async {
+    final value = await _storage.read(key: _feedbackUrlKey);
+    if (value == null || value.trim().isEmpty) {
+      return null;
+    }
+    return value.trim();
+  }
+
+  Future<void> saveFeedbackUrl(String? value) async {
+    if (value == null || value.trim().isEmpty) {
+      await _storage.delete(key: _feedbackUrlKey);
+      return;
+    }
+    await _storage.write(key: _feedbackUrlKey, value: value.trim());
   }
 
   Future<void> savePendingEnrollment(String payloadJson) async {

@@ -23,7 +23,7 @@ This guide provides repeatable steps to generate data for the paper tables.
 Start backend first:
 
 ```bash
-cd /Users/patrick-m/Documents/ZT-Authenticator/backend
+cd /Users/<user>/Documents/ZT-Authenticator/backend
 ./scripts/generate_dev_cert.sh
 ./run.sh
 ```
@@ -31,7 +31,7 @@ cd /Users/patrick-m/Documents/ZT-Authenticator/backend
 Then collect data:
 
 ```bash
-cd /Users/patrick-m/Documents/ZT-Authenticator
+cd /Users/<user>/Documents/ZT-Authenticator
 source backend/.venv/bin/activate
 python scripts/collect_metrics.py --base-url https://localhost:8000 --trials 30 --recovery-trials 8 --drift-trials 20 --drift-seconds 120 --output experiments/results.csv
 ```

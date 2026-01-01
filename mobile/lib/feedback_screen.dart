@@ -88,6 +88,11 @@ class _FeedbackScreenState extends State<FeedbackScreen> {
               'We use feedback to improve ZT-Authenticator. Tell us what you need.',
               style: TextStyle(color: ZtIamColors.textSecondary),
             ),
+            const SizedBox(height: 8),
+            Text(
+              'Sending to ${widget.apiClient.baseUrl}',
+              style: const TextStyle(color: ZtIamColors.textSecondary, fontSize: 12),
+            ),
             const SizedBox(height: 16),
             TextField(
               controller: _emailController,

@@ -3,7 +3,7 @@
 ## Setup
 
 ```bash
-cd /Users/patrick-m/Documents/ZT-Authenticator/backend
+cd /Users/<user>/Documents/ZT-Authenticator/backend
 source .venv/bin/activate
 cp .env.example .env
 ```

@@ -3,7 +3,7 @@
 ## Quick start
 
 ```bash
-cd /Users/patrick-m/Documents/ZT-Authenticator/mobile
+cd /Users/<user>/Documents/ZT-Authenticator/mobile
 flutter run -d emulator-5554
 ```
 
