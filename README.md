@@ -12,7 +12,7 @@ ZT-Authenticator is a research-oriented Zero Trust take on time-based one-time p
 ## Quick start
 1. **Bring up local dependencies**
    ```bash
-   docker compose up -d
+   podman compose up -d
    ```
 2. **Run the backend** by following the steps in the [backend README](backend/README.md) (virtualenv, environment variables, TLS cert generation, and schema bootstrap).
 3. **Run the mobile app** using the [mobile README](mobile/README.md) (emulator target, backend URL, and setup key inputs).
