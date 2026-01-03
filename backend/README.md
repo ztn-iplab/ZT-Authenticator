@@ -48,7 +48,7 @@ The public key stored during enrollment can be either:
 For Android Keystore we currently recommend P-256 (secp256r1) keys with
 `SHA256withECDSA` signatures. Set `key_type` to `p256` for this flow.
 
-## ZT flow overview (research path)
+## ZT flow overview
 
 1) **Enroll device**: client generates a device-bound keypair and sends the public key to `/enroll`.
 2) **Register TOTP**: server issues a secret and recovery codes at `/totp/register`.
@@ -74,7 +74,7 @@ The ZT-Authenticator app silently approves the login in the background.
 If the device is offline, use a recovery code in the same form. Recovery codes
 are one-time use and bypass the device approval step.
 
-## Security design notes (academic detail)
+## Security design notes
 
 ### Compatibility with existing authenticators
 - **TOTP generation remains offline and unchanged.** The OTP is still derived
