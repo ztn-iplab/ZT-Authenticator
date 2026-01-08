@@ -108,3 +108,18 @@ async def prune_expired(pool: asyncpg.Pool) -> None:
         WHERE status = 'pending' AND expires_at < NOW()
         """,
     )
+
+
+async def clear_pending_for_user(pool: asyncpg.Pool, user_id: UUID) -> int:
+    result = await pool.execute(
+        """
+        UPDATE login_challenges
+        SET status = 'denied', denied_reason = 'user_cleared'
+        WHERE user_id = $1 AND status = 'pending'
+        """,
+        user_id,
+    )
+    try:
+        return int(result.split(" ")[-1])
+    except (IndexError, ValueError):
+        return 0

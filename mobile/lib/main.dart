@@ -133,6 +133,41 @@ class _HomeScreenState extends State<HomeScreen> {
     });
   }
 
+  Future<void> _updateAllAccountsBaseUrl(String baseUrl) async {
+    final trimmed = baseUrl.trim();
+    if (trimmed.isEmpty) {
+      return;
+    }
+    final normalized = trimmed.startsWith('http://') || trimmed.startsWith('https://')
+        ? trimmed
+        : 'https://$trimmed';
+    final accounts = List<TotpAccount>.from(_totpAccounts);
+    for (final account in accounts) {
+      final updated = TotpAccount(
+        issuer: account.issuer,
+        account: account.account,
+        secret: account.secret,
+        userId: account.userId,
+        rpId: account.rpId,
+        deviceId: account.deviceId,
+        apiBaseUrl: normalized,
+        keyId: account.keyId,
+      );
+      await _store.delete(account.toRecord());
+      await _store.save(updated.toRecord());
+      final idx = _totpAccounts.indexOf(account);
+      if (idx >= 0) {
+        _totpAccounts[idx] = updated;
+      }
+    }
+    if (!mounted) {
+      return;
+    }
+    setState(() {
+      _fallbackApiBaseUrl = normalized;
+    });
+  }
+
   Future<void> _showAccountInfo() async {
     final accounts = List<TotpAccount>.from(_totpAccounts);
     await showDialog<void>(
@@ -527,23 +562,10 @@ class _HomeScreenState extends State<HomeScreen> {
                         accounts: List<TotpAccount>.from(_totpAccounts),
                         deviceCrypto: _deviceCrypto,
                         allowInsecureTls: _allowInsecureTls,
+                        fallbackBaseUrl: _fallbackApiBaseUrl,
                       ),
                     ),
                   );
-                },
-              ),
-              _SheetAction(
-                icon: Icons.delete_outline,
-                label: 'Clear local accounts',
-                onTap: () async {
-                  await _store.clearAll();
-                  if (!mounted) {
-                    return;
-                  }
-                  setState(() {
-                    _totpAccounts.clear();
-                  });
-                  Navigator.of(context).pop();
                 },
               ),
               const SizedBox(height: 12),
@@ -1789,11 +1811,13 @@ class LoginApprovalsScreen extends StatefulWidget {
     required this.accounts,
     required this.deviceCrypto,
     required this.allowInsecureTls,
+    required this.fallbackBaseUrl,
   });
 
   final List<TotpAccount> accounts;
   final DeviceCrypto deviceCrypto;
   final bool allowInsecureTls;
+  final String fallbackBaseUrl;
 
   @override
   State<LoginApprovalsScreen> createState() => _LoginApprovalsScreenState();
@@ -1824,6 +1848,9 @@ class _LoginApprovalsScreenState extends State<LoginApprovalsScreen> {
   String _resolveAccountBaseUrl(TotpAccount account) {
     if (account.apiBaseUrl.trim().isNotEmpty) {
       return account.apiBaseUrl.trim();
+    }
+    if (widget.fallbackBaseUrl.trim().isNotEmpty) {
+      return widget.fallbackBaseUrl.trim();
     }
     if (account.rpId.trim().isNotEmpty) {
       return 'https://${account.rpId.trim()}/api/auth';
@@ -2007,6 +2034,44 @@ class _LoginApprovalsScreenState extends State<LoginApprovalsScreen> {
     }
   }
 
+  Future<void> _clearPending() async {
+    setState(() {
+      _loading = true;
+      _status = '';
+    });
+    try {
+      var clearedAny = false;
+      for (final account in widget.accounts) {
+        if (account.userId.isEmpty) {
+          continue;
+        }
+        final response = await _accountPost(account, '/login/clear', {
+          'user_id': account.userId,
+        });
+        if (response != null) {
+          clearedAny = true;
+        }
+      }
+      await _refresh();
+      setState(() {
+        _status = clearedAny
+            ? 'Pending approvals cleared.'
+            : 'No server configured for pending approvals.';
+      });
+    } catch (error) {
+      setState(() {
+        _status = 'Error: $error';
+      });
+    } finally {
+      if (mounted) {
+        setState(() {
+          _loading = false;
+        });
+      }
+    }
+  }
+
+
   @override
   Widget build(BuildContext context) {
     final pending = _pending;
@@ -2059,9 +2124,37 @@ class _LoginApprovalsScreenState extends State<LoginApprovalsScreen> {
             Text(_status, style: const TextStyle(color: Colors.white70)),
           ],
           const SizedBox(height: 16),
-          ElevatedButton(
-            onPressed: _loading ? null : _refresh,
-            child: const Text('Refresh'),
+          Row(
+            children: [
+              Expanded(
+                child: ElevatedButton(
+                  style: ElevatedButton.styleFrom(
+                    minimumSize: const Size.fromHeight(44),
+                  ),
+                  onPressed: _loading ? null : _refresh,
+                  child: const Text('Refresh'),
+                ),
+              ),
+              const SizedBox(width: 12),
+              Expanded(
+                child: ElevatedButton(
+                  style: ElevatedButton.styleFrom(
+                    backgroundColor: ZtIamColors.card,
+                    foregroundColor: Colors.white,
+                    minimumSize: const Size.fromHeight(44),
+                  ),
+                  onPressed: _loading ? null : _clearPending,
+                  child: const FittedBox(
+                    fit: BoxFit.scaleDown,
+                    child: Text(
+                      'Clear pending',
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                    ),
+                  ),
+                ),
+              ),
+            ],
           ),
         ],
       ),

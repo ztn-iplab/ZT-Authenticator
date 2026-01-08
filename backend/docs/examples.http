@@ -109,6 +109,14 @@ Content-Type: application/json
   "reason": "user_denied"
 }
 
+### Login clear (device clears pending approvals)
+POST https://localhost:8000/login/clear
+Content-Type: application/json
+
+{
+  "user_id": "<USER_ID>"
+}
+
 ### Recovery code verify (consumes code)
 POST https://localhost:8000/totp/recovery/verify
 Content-Type: application/json

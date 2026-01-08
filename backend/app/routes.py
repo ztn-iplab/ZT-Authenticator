@@ -30,6 +30,8 @@ from app.totp_service import (
 from app.crypto_utils import hash_otp
 from app.verification import (
     LoginApproveRequest,
+    LoginClearRequest,
+    LoginClearResponse,
     LoginDenyRequest,
     LoginPendingResponse,
     LoginRecoveryRequest,
@@ -393,6 +395,13 @@ async def login_deny(payload: LoginDenyRequest) -> LoginResponse:
         return LoginResponse(status=challenge["status"], reason=challenge["denied_reason"])
     await login_challenges.mark_denied(pool, payload.login_id, payload.reason)
     return LoginResponse(status="denied", reason=payload.reason)
+
+
+@router.post("/login/clear", response_model=LoginClearResponse)
+async def login_clear(payload: LoginClearRequest) -> LoginClearResponse:
+    pool = await db.connect()
+    cleared = await login_challenges.clear_pending_for_user(pool, payload.user_id)
+    return LoginClearResponse(status="ok", cleared=cleared)
 
 
 @router.post("/login/recover", response_model=LoginRecoveryResponse)

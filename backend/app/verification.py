@@ -57,3 +57,12 @@ class LoginRecoveryResponse(BaseModel):
 class LoginDenyRequest(BaseModel):
     login_id: UUID
     reason: str = Field(..., min_length=1, max_length=100)
+
+
+class LoginClearRequest(BaseModel):
+    user_id: UUID
+
+
+class LoginClearResponse(BaseModel):
+    status: str
+    cleared: int
