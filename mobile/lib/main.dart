@@ -1849,9 +1849,6 @@ class _LoginApprovalsScreenState extends State<LoginApprovalsScreen> {
     if (account.apiBaseUrl.trim().isNotEmpty) {
       return account.apiBaseUrl.trim();
     }
-    if (widget.fallbackBaseUrl.trim().isNotEmpty) {
-      return widget.fallbackBaseUrl.trim();
-    }
     if (account.rpId.trim().isNotEmpty) {
       return 'https://${account.rpId.trim()}/api/auth';
     }
@@ -1902,24 +1899,30 @@ class _LoginApprovalsScreenState extends State<LoginApprovalsScreen> {
       _status = '';
     });
     try {
+      String? lastError;
       for (final account in widget.accounts) {
         if (account.userId.isEmpty) {
           continue;
         }
-        final data = await _accountGet(account, '/login/pending?user_id=${account.userId}');
-        if (data == null) {
-          continue;
-        }
-        if (data['status'] == 'pending') {
-          setState(() {
-            _pending = data;
-          });
-          return;
+        try {
+          final data =
+              await _accountGet(account, '/login/pending?user_id=${account.userId}');
+          if (data == null) {
+            continue;
+          }
+          if (data['status'] == 'pending') {
+            setState(() {
+              _pending = data;
+            });
+            return;
+          }
+        } catch (error) {
+          lastError = 'Error: $error';
         }
       }
       setState(() {
         _pending = null;
-        _status = 'No pending logins.';
+        _status = lastError ?? 'No pending logins.';
       });
     } catch (error) {
       setState(() {
@@ -2040,23 +2043,22 @@ class _LoginApprovalsScreenState extends State<LoginApprovalsScreen> {
       _status = '';
     });
     try {
-      var clearedAny = false;
-      for (final account in widget.accounts) {
-        if (account.userId.isEmpty) {
-          continue;
-        }
-        final response = await _accountPost(account, '/login/clear', {
-          'user_id': account.userId,
+      final pending = _pending;
+      final account = pending == null ? null : _matchAccount(pending);
+      if (account == null) {
+        setState(() {
+          _status = 'No pending login to clear.';
         });
-        if (response != null) {
-          clearedAny = true;
-        }
+        return;
       }
+      final response = await _accountPost(account, '/login/clear', {
+        'user_id': account.userId,
+      });
       await _refresh();
       setState(() {
-        _status = clearedAny
+        _status = response != null
             ? 'Pending approvals cleared.'
-            : 'No server configured for pending approvals.';
+            : 'Clear pending failed.';
       });
     } catch (error) {
       setState(() {
