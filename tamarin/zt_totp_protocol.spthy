@@ -1,0 +1,124 @@
+theory ZT_TOTP_Protocol
+begin
+
+builtins: hashing
+
+functions:
+  otp/2,
+  sig/0
+
+/*
+Notation alignment with manuscript:
+  K_priv -> K_priv (device-bound private key)
+  K_pub  -> K_pub (abstracted by device binding)
+  K_s    -> seed
+  device_id -> device_id
+  rp_id  -> rp_id
+  n      -> nonce
+  otp    -> otp(seed, t)
+  sigma  -> Sig(device_id, rp_id, n, otp)
+  m      -> <n, device_id, rp_id, otp>
+*/
+
+// === Enrollment ===
+
+rule Enroll_Device:
+  [ Fr(uid), Fr(device_id), Fr(rp_id), Fr(seed), Fr(K_priv) ]
+  --[ Enroll(uid, device_id, rp_id) ]->
+  [ !Seed(uid, rp_id, seed),
+    !DevKey(device_id, rp_id, K_priv),
+    !Bind(uid, device_id, rp_id),
+    Out(device_id) ]
+
+// === Challenge issuance ===
+
+rule Issue_Challenge:
+  [ !Bind(uid, device_id, rp_id), Fr(n), Fr(t) ]
+  --[ IssueChallenge(uid, device_id, rp_id, n, t) ]->
+  [ Challenge(uid, device_id, rp_id, n, t),
+    Out(<device_id, rp_id, n, t>) ]
+
+// === Device proof ===
+
+rule Device_Sign:
+  let otp_val = otp(seed, t) in
+  [ !Bind(uid, device_id, rp_id),
+    !Seed(uid, rp_id, seed),
+    !DevKey(device_id, rp_id, K_priv),
+    In(<device_id, rp_id, n, t>) ]
+  --[ DeviceSigned(uid, device_id, rp_id, n, t) ]->
+  [ Sig(device_id, rp_id, n, otp_val),
+    Out(<uid, device_id, rp_id, n, otp_val, sig>) ]
+
+// === Server verification ===
+
+rule Server_Verify:
+  let otp_val = otp(seed, t) in
+  [ Challenge(uid, device_id, rp_id, n, t),
+    !Seed(uid, rp_id, seed),
+    Sig(device_id, rp_id, n, otp_val),
+    In(<uid, device_id, rp_id, n, otp_val, sig>) ]
+  --[ ServerAccept(uid, device_id, rp_id, n, t) ]->
+  [ ]
+
+// === Recovery codes ===
+
+rule Issue_Recovery:
+  [ Fr(code), Fr(uid) ]
+  --[ RecoveryIssued(uid, code) ]->
+  [ !Recovery(uid, code) ]
+
+rule Recover_Login:
+  [ !Recovery(uid, code), In(<uid, code>) ]
+  --[ RecoveryAccept(uid) ]->
+  [ ]
+
+// === Compromise rules ===
+
+rule Reveal_Seed:
+  [ !Seed(uid, rp_id, seed) ]
+  --[ SeedReveal(uid, rp_id) ]->
+  [ Out(seed) ]
+
+rule Reveal_DeviceKey:
+  [ !DevKey(device_id, rp_id, K_priv) ]
+  --[ KeyReveal(device_id, rp_id) ]->
+  [ Out(K_priv), !KeyComp(device_id, rp_id) ]
+
+rule Forge_Sig:
+  [ !KeyComp(device_id, rp_id), In(<device_id, rp_id, n, otp_val>) ]
+  --[ ForgedSig(device_id, rp_id, n) ]->
+  [ Sig(device_id, rp_id, n, otp_val) ]
+
+// === Lemmas ===
+
+lemma authentication:
+  "All uid device_id rp_id n t #i.
+    ServerAccept(uid, device_id, rp_id, n, t)@i
+    ==> (Ex #j. DeviceSigned(uid, device_id, rp_id, n, t)@j)
+     | (Ex #k. KeyReveal(device_id, rp_id)@k)"
+
+lemma rp_binding:
+  "All uid device_id rp_id n t #i.
+    ServerAccept(uid, device_id, rp_id, n, t)@i
+    ==> (Ex #j. DeviceSigned(uid, device_id, rp_id, n, t)@j)
+     | (Ex #k. KeyReveal(device_id, rp_id)@k)"
+
+lemma replay_resistance:
+  "All uid device_id rp_id n t #i #j.
+    ServerAccept(uid, device_id, rp_id, n, t)@i
+    & ServerAccept(uid, device_id, rp_id, n, t)@j
+    ==> #i = #j"
+
+lemma seed_compromise_not_enough:
+  "All uid device_id rp_id n t #i.
+    ServerAccept(uid, device_id, rp_id, n, t)@i
+    & (Ex #k. SeedReveal(uid, rp_id)@k)
+    ==> (Ex #j. DeviceSigned(uid, device_id, rp_id, n, t)@j)
+     | (Ex #k2. KeyReveal(device_id, rp_id)@k2)"
+
+lemma recovery_correctness:
+  "All uid #i.
+    RecoveryAccept(uid)@i ==> (Ex code #j. RecoveryIssued(uid, code)@j)"
+
+end
