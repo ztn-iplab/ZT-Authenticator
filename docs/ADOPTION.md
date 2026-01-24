@@ -224,7 +224,7 @@ Record at least:
 - **Mitigation**: pending logins have short TTL and can be rate‑limited at the
   service edge (deployment responsibility).
 
-## Research argument: why a handshake is necessary
+## why a handshake is necessary
 
 ### Classic TOTP (no handshake)
 Classic TOTP relies on a shared seed and time synchronization. The server
