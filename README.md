@@ -1,6 +1,6 @@
 # ZT-Authenticator
 
-ZT-Authenticator is a research-oriented Zero Trust take on time-based one-time passwords (TOTP). It combines classic TOTP factors with device-bound and relying party cryptographic proofs, so login approvals require both the shared secret and possession of the enrolled device key.
+ZT-Authenticator is a research-oriented Zero Trust take on time-based one-time passwords (TOTP). It combines classic TOTP factors with device-bound and relying party(RP) cryptographic proofs, so login approvals require both the shared secret, possession of the enrolled device key and the RP.
 
 ## Repository structure
 - **backend/** – HTTPS API, enrollment, verification, and recovery flows. See the [backend README](backend/README.md) for setup, database initialization, and protocol details.
