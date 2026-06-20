@@ -371,9 +371,6 @@ class _HomeScreenState extends State<HomeScreen> {
     if (trimmed.isEmpty || uri == null) {
       return trimmed;
     }
-    if (_allowHttpDev && _isLocalHost(uri.host)) {
-      return uri.replace(scheme: 'http').toString();
-    }
     return trimmed;
   }
 
@@ -1636,12 +1633,9 @@ class _TotpSetupScreenState extends State<TotpSetupScreen> {
     try {
       final cleaned = _stripWhitespace(value);
       final uri = Uri.parse(cleaned);
-      var scheme = uri.scheme.isEmpty ? 'https' : uri.scheme;
+      final scheme = uri.scheme.isEmpty ? 'https' : uri.scheme;
       final host = uri.host.isEmpty ? uri.path : uri.host;
       final port = uri.hasPort ? ':${uri.port}' : '';
-      if (_allowHttpDev && _isLocalAddress(host)) {
-        scheme = 'http';
-      }
       final path = uri.path;
       if (path.contains('/api/auth')) {
         return '$scheme://$host$port/api/auth';
@@ -2259,9 +2253,6 @@ class _LoginApprovalsScreenState extends State<LoginApprovalsScreen> {
     final uri = Uri.tryParse(trimmed);
     if (trimmed.isEmpty || uri == null) {
       return trimmed;
-    }
-    if (widget.allowHttpDev && _isLocalHost(uri.host)) {
-      return uri.replace(scheme: 'http').toString();
     }
     return trimmed;
   }

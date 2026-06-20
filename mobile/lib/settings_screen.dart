@@ -73,7 +73,8 @@ class _SettingsScreenState extends State<SettingsScreen> {
     return Scaffold(
       appBar: AppBar(title: const Text('Settings')),
       body: Container(
-        decoration: const BoxDecoration(gradient: ZtIamColors.backgroundGradient),
+        decoration:
+            const BoxDecoration(gradient: ZtIamColors.backgroundGradient),
         child: ListView(
           padding: const EdgeInsets.all(16),
           children: [
@@ -89,7 +90,8 @@ class _SettingsScreenState extends State<SettingsScreen> {
             SwitchListTile(
               value: _loginPolling,
               title: const Text('Login approval polling'),
-              subtitle: const Text('Check for login approvals every few seconds.'),
+              subtitle:
+                  const Text('Check for login approvals every few seconds.'),
               onChanged: (value) => setState(() => _loginPolling = value),
             ),
             SwitchListTile(
@@ -101,7 +103,9 @@ class _SettingsScreenState extends State<SettingsScreen> {
             SwitchListTile(
               value: _allowHttpDev,
               title: const Text('Allow HTTP for local testing'),
-              subtitle: const Text('Use only when HTTPS is unavailable on LAN.'),
+              subtitle: const Text(
+                'Use HTTP only for local server names entered without a scheme.',
+              ),
               onChanged: (value) => setState(() => _allowHttpDev = value),
             ),
             const SizedBox(height: 16),
@@ -111,7 +115,8 @@ class _SettingsScreenState extends State<SettingsScreen> {
             ),
             if (_status.isNotEmpty) ...[
               const SizedBox(height: 12),
-              Text(_status, style: const TextStyle(color: ZtIamColors.textSecondary)),
+              Text(_status,
+                  style: const TextStyle(color: ZtIamColors.textSecondary)),
             ],
           ],
         ),
