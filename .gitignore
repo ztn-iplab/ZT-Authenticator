@@ -23,5 +23,6 @@ pubspec.lock
 .vscode/
 experiments/
 artifacts/local-builds/
+artifacts/private-signing/
 backend/certs/
 *.log
