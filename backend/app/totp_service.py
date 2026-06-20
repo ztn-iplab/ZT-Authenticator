@@ -7,6 +7,8 @@ import pyotp
 from app.crypto_utils import fernet_from_key, hash_recovery_code
 from app.repositories import totp
 
+TOTP_INTERVAL_SECONDS = 30
+
 
 def generate_recovery_codes(count: int = 8) -> List[str]:
     return [secrets.token_hex(4) for _ in range(count)]
@@ -17,7 +19,7 @@ def build_otpauth_uri(
     account_name: str,
     issuer: str,
 ) -> str:
-    totp = pyotp.TOTP(secret)
+    totp = pyotp.TOTP(secret, interval=TOTP_INTERVAL_SECONDS)
     return totp.provisioning_uri(name=account_name, issuer_name=issuer)
 
 
@@ -57,13 +59,12 @@ async def register_totp(
 
 
 def verify_totp(secret: str, otp: str) -> bool:
-    # Allow small clock drift between device and server.
-    totp_obj = pyotp.TOTP(secret)
-    return bool(totp_obj.verify(otp, valid_window=2))
+    totp_obj = pyotp.TOTP(secret, interval=TOTP_INTERVAL_SECONDS)
+    return bool(totp_obj.verify(otp.strip(), valid_window=0))
 
 
 def current_totp(secret: str) -> str:
-    totp_obj = pyotp.TOTP(secret)
+    totp_obj = pyotp.TOTP(secret, interval=TOTP_INTERVAL_SECONDS)
     return totp_obj.now()
 
 

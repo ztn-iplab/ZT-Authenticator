@@ -66,6 +66,47 @@ async def get_by_device_and_rp(
     return _row_to_device_key(row)
 
 
+async def get_by_user_and_rp(
+    pool: asyncpg.Pool,
+    user_id: UUID,
+    rp_id: UUID,
+) -> DeviceKeyOut | None:
+    row = await pool.fetchrow(
+        """
+        SELECT device_keys.id, device_keys.device_id, device_keys.rp_id,
+               device_keys.key_type, device_keys.public_key, device_keys.created_at
+        FROM device_keys
+        JOIN devices ON devices.id = device_keys.device_id
+        WHERE devices.user_id = $1 AND device_keys.rp_id = $2
+        ORDER BY device_keys.created_at DESC
+        LIMIT 1
+        """,
+        user_id,
+        rp_id,
+    )
+    if row is None:
+        return None
+    return _row_to_device_key(row)
+
+
+async def get_by_public_key(
+    pool: asyncpg.Pool,
+    public_key: str,
+) -> DeviceKeyOut | None:
+    row = await pool.fetchrow(
+        """
+        SELECT id, device_id, rp_id, key_type, public_key, created_at
+        FROM device_keys
+        WHERE public_key = $1
+        LIMIT 1
+        """,
+        public_key,
+    )
+    if row is None:
+        return None
+    return _row_to_device_key(row)
+
+
 async def upsert_by_device_and_rp(
     pool: asyncpg.Pool,
     device_id: UUID,

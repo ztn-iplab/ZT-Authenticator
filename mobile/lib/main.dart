@@ -6,7 +6,6 @@ import 'dart:io';
 import 'package:flutter/material.dart';
 import 'package:flutter_slidable/flutter_slidable.dart';
 import 'package:flutter/services.dart';
-import 'package:crypto/crypto.dart';
 import 'app_settings.dart';
 import 'device_crypto.dart';
 import 'feedback_screen.dart';
@@ -60,6 +59,7 @@ class _HomeScreenState extends State<HomeScreen> {
   Timer? _loginPoller;
   final DeviceCrypto _deviceCrypto = DeviceCrypto();
   bool _approvalDialogOpen = false;
+  bool _loginPollInFlight = false;
   String _lastLoginId = '';
   bool _poiaDialogOpen = false;
   String _lastPoiaIntentId = '';
@@ -111,7 +111,7 @@ class _HomeScreenState extends State<HomeScreen> {
       _loginPoller = null;
       return;
     }
-    _loginPoller = Timer.periodic(const Duration(seconds: 5), (_) {
+    _loginPoller = Timer.periodic(const Duration(seconds: 2), (_) {
       _pollLoginApprovals();
       _pollPoiaApprovals();
     });
@@ -146,9 +146,10 @@ class _HomeScreenState extends State<HomeScreen> {
     if (trimmed.isEmpty) {
       return;
     }
-    final normalized = trimmed.startsWith('http://') || trimmed.startsWith('https://')
-        ? trimmed
-        : 'https://$trimmed';
+    final normalized =
+        trimmed.startsWith('http://') || trimmed.startsWith('https://')
+            ? trimmed
+            : 'https://$trimmed';
     final accounts = List<TotpAccount>.from(_totpAccounts);
     for (final account in accounts) {
       final updated = TotpAccount(
@@ -354,6 +355,16 @@ class _HomeScreenState extends State<HomeScreen> {
         RegExp(r'^[0-9.]+$').hasMatch(host);
   }
 
+  bool _sameRpFamily(String left, String right) {
+    final a = left.trim().toLowerCase();
+    final b = right.trim().toLowerCase();
+    if (a == b) {
+      return true;
+    }
+    const aliases = {'zt-iam.com', 'ztiam.com', 'zt-aim.com'};
+    return aliases.contains(a) && aliases.contains(b);
+  }
+
   String _coerceBaseUrl(String raw) {
     final trimmed = raw.trim();
     final uri = Uri.tryParse(trimmed);
@@ -386,9 +397,12 @@ class _HomeScreenState extends State<HomeScreen> {
   }
 
   String _resolveFeedbackBaseUrl() {
+    if (_fallbackApiBaseUrl.trim().isNotEmpty) {
+      return _coerceBaseUrl(_fallbackApiBaseUrl);
+    }
     return _totpAccounts
         .map(_resolveAccountBaseUrl)
-        .firstWhere((value) => value.isNotEmpty, orElse: () => _fallbackApiBaseUrl);
+        .firstWhere((value) => value.isNotEmpty, orElse: () => '');
   }
 
   Future<Map<String, dynamic>?> _accountGet(
@@ -399,7 +413,8 @@ class _HomeScreenState extends State<HomeScreen> {
     if (baseUrl.isEmpty) {
       return null;
     }
-    final client = ApiClient(baseUrl: baseUrl, allowInsecureTls: _allowInsecureTls);
+    final client =
+        ApiClient(baseUrl: baseUrl, allowInsecureTls: _allowInsecureTls);
     try {
       final response = await client.get(path);
       if (response.statusCode != 200) {
@@ -420,7 +435,8 @@ class _HomeScreenState extends State<HomeScreen> {
     if (baseUrl.isEmpty) {
       return;
     }
-    final client = ApiClient(baseUrl: baseUrl, allowInsecureTls: _allowInsecureTls);
+    final client =
+        ApiClient(baseUrl: baseUrl, allowInsecureTls: _allowInsecureTls);
     try {
       await client.postJson(path, payload);
     } finally {
@@ -429,26 +445,40 @@ class _HomeScreenState extends State<HomeScreen> {
   }
 
   Future<void> _pollLoginApprovals() async {
-    if (_totpAccounts.isEmpty) {
+    if (_totpAccounts.isEmpty || _loginPollInFlight) {
       return;
     }
-    for (final account in _totpAccounts) {
-      if (account.userId.isEmpty || account.rpId.isEmpty || account.deviceId.isEmpty) {
-        continue;
+    _loginPollInFlight = true;
+    try {
+      final candidates = _totpAccounts
+          .where((account) =>
+              account.userId.isNotEmpty &&
+              account.rpId.isNotEmpty &&
+              account.deviceId.isNotEmpty)
+          .toList(growable: false);
+      if (candidates.isEmpty) {
+        return;
       }
-      try {
-        final data = await _accountGet(account, '/login/pending?user_id=${account.userId}');
-        if (data == null) {
-          continue;
-        }
-        if (data['status'] != 'pending') {
+      final futures = candidates
+          .map(
+            (account) => _accountGet(
+              account,
+              '/login/pending?user_id=${account.userId}',
+            ).timeout(const Duration(seconds: 2), onTimeout: () => null),
+          )
+          .toList(growable: false);
+      final results = await Future.wait(futures);
+      for (var i = 0; i < candidates.length; i++) {
+        final account = candidates[i];
+        final data = results[i];
+        if (data == null || data['status'] != 'pending') {
           continue;
         }
         final pendingRp = data['rp_id'] as String? ?? '';
         final pendingDevice = data['device_id'] as String? ?? '';
         final loginId = data['login_id'] as String? ?? '';
         final nonce = data['nonce'] as String? ?? '';
-        if (pendingRp != account.rpId ||
+        if (!_sameRpFamily(pendingRp, account.rpId) ||
             pendingDevice != account.deviceId ||
             loginId.isEmpty ||
             nonce.isEmpty) {
@@ -466,11 +496,14 @@ class _HomeScreenState extends State<HomeScreen> {
           account: account,
           loginId: loginId,
           nonce: nonce,
+          pendingRp: pendingRp,
+          pendingDevice: pendingDevice,
         );
         _approvalDialogOpen = false;
-      } catch (_) {
-        continue;
+        return;
       }
+    } finally {
+      _loginPollInFlight = false;
     }
   }
 
@@ -478,13 +511,15 @@ class _HomeScreenState extends State<HomeScreen> {
     required TotpAccount account,
     required String loginId,
     required String nonce,
+    required String pendingRp,
+    required String pendingDevice,
   }) async {
     await showDialog<void>(
       context: context,
       barrierDismissible: false,
       builder: (context) {
         return AlertDialog(
-          title: const Text('Approve login?'),
+          title: const Text('Sign login request?'),
           content: Text('Account: ${account.account}\nRP: ${account.rpId}'),
           actions: [
             ElevatedButton(
@@ -511,17 +546,17 @@ class _HomeScreenState extends State<HomeScreen> {
               onPressed: () async {
                 final otp = account.currentCode();
                 final signature = await _deviceCrypto.sign(
-                  rpId: account.rpId,
+                  rpId: pendingRp,
                   nonce: nonce,
-                  deviceId: account.deviceId,
+                  deviceId: pendingDevice,
                   otp: otp,
                   keyId: account.keyId.isEmpty ? account.rpId : account.keyId,
                 );
                 if (signature.isNotEmpty) {
                   await _accountPost(account, '/login/approve', {
                     'login_id': loginId,
-                    'device_id': account.deviceId,
-                    'rp_id': account.rpId,
+                    'device_id': pendingDevice,
+                    'rp_id': pendingRp,
                     'otp': otp,
                     'nonce': nonce,
                     'signature': signature,
@@ -531,7 +566,7 @@ class _HomeScreenState extends State<HomeScreen> {
                   Navigator.of(context).pop();
                 }
               },
-              child: const Text('Approve'),
+              child: const Text('Sign'),
             ),
           ],
         );
@@ -548,67 +583,22 @@ class _HomeScreenState extends State<HomeScreen> {
     return '${uri.scheme}://${uri.authority}';
   }
 
-  dynamic _canonicalize(dynamic value) {
-    if (value is Map) {
-      final keys = value.keys.map((key) => key.toString()).toList()..sort();
-      final result = <String, dynamic>{};
-      for (final key in keys) {
-        result[key] = _canonicalize(value[key]);
-      }
-      return result;
-    }
-    if (value is List) {
-      return value.map(_canonicalize).toList();
-    }
-    return value;
-  }
-
-  List<int> _canonicalJsonBytes(Map<String, dynamic> data) {
-    final canonical = _canonicalize(data);
-    return utf8.encode(jsonEncode(canonical));
-  }
-
-  String _intentBodyHash(Map<String, dynamic> intent) {
-    final digest = sha256.convert(_canonicalJsonBytes(intent));
-    return base64UrlEncode(digest.bytes);
-  }
-
-  String _sha256Hex(List<int> payload) {
-    final digest = sha256.convert(payload);
-    final buffer = StringBuffer();
-    for (final byte in digest.bytes) {
-      buffer.write(byte.toRadixString(16).padLeft(2, '0'));
-    }
-    return buffer.toString();
-  }
-
-  String _proofPayloadHashHex({
-    required Map<String, dynamic> intent,
-    required String nonce,
-    required int expiresAt,
-  }) {
-    final intentHash = _intentBodyHash(intent);
-    final payload = {
-      'intent_hash': intentHash,
-      'nonce': nonce,
-      'expires_at': expiresAt,
-    };
-    return _sha256Hex(_canonicalJsonBytes(payload));
-  }
-
   Future<void> _pollPoiaApprovals() async {
     if (_totpAccounts.isEmpty) {
       return;
     }
     for (final account in _totpAccounts) {
-      if (account.userId.isEmpty || account.deviceId.isEmpty || account.rpId.isEmpty) {
+      if (account.userId.isEmpty ||
+          account.deviceId.isEmpty ||
+          account.rpId.isEmpty) {
         continue;
       }
       final baseUrl = _resolvePoiaBaseUrl(account);
       if (baseUrl.isEmpty) {
         continue;
       }
-      final client = ApiClient(baseUrl: baseUrl, allowInsecureTls: _allowInsecureTls);
+      final client =
+          ApiClient(baseUrl: baseUrl, allowInsecureTls: _allowInsecureTls);
       try {
         final response =
             await client.get('/api/poia/pending?user_id=${account.userId}');
@@ -621,9 +611,13 @@ class _HomeScreenState extends State<HomeScreen> {
         }
         final intentId = data['intent_id']?.toString() ?? '';
         final nonce = data['nonce']?.toString() ?? '';
+        final proofHash = data['intent_hash']?.toString() ?? '';
         final rpId = (data['rp_id'] as String?)?.trim() ?? account.rpId;
         final intentRaw = data['intent'];
-        if (intentId.isEmpty || nonce.isEmpty || intentRaw is! Map) {
+        if (intentId.isEmpty ||
+            nonce.isEmpty ||
+            proofHash.isEmpty ||
+            intentRaw is! Map) {
           continue;
         }
         if (rpId.isNotEmpty && rpId != account.rpId) {
@@ -642,9 +636,9 @@ class _HomeScreenState extends State<HomeScreen> {
           intentId: intentId,
           intent: Map<String, dynamic>.from(intentRaw),
           nonce: nonce,
+          proofHash: proofHash,
           rpId: rpId,
           baseUrl: baseUrl,
-          expiresAt: (data['expires_at'] as num?)?.toInt() ?? 0,
           expiresIn: (data['expires_in'] as num?)?.toInt() ?? 0,
         );
         _poiaDialogOpen = false;
@@ -661,9 +655,9 @@ class _HomeScreenState extends State<HomeScreen> {
     required String intentId,
     required Map<String, dynamic> intent,
     required String nonce,
+    required String proofHash,
     required String rpId,
     required String baseUrl,
-    required int expiresAt,
     required int expiresIn,
   }) async {
     await showDialog<void>(
@@ -679,22 +673,15 @@ class _HomeScreenState extends State<HomeScreen> {
                 submitting = true;
                 status = approve ? 'Sending approval...' : 'Sending denial...';
               });
-              final client = ApiClient(baseUrl: baseUrl, allowInsecureTls: _allowInsecureTls);
+              final client = ApiClient(
+                  baseUrl: baseUrl, allowInsecureTls: _allowInsecureTls);
               try {
                 if (approve) {
-                  final effectiveExpiresAt = expiresAt > 0
-                      ? expiresAt
-                      : (DateTime.now().millisecondsSinceEpoch ~/ 1000) + expiresIn;
-                  final intentHashHex = _proofPayloadHashHex(
-                    intent: intent,
-                    nonce: nonce,
-                    expiresAt: effectiveExpiresAt,
-                  );
                   final signature = await _deviceCrypto.sign(
                     rpId: rpId,
                     nonce: nonce,
                     deviceId: account.deviceId,
-                    otp: intentHashHex,
+                    otp: proofHash,
                     keyId: account.keyId.isEmpty ? account.rpId : account.keyId,
                   );
                   final response = await client.postJson('/api/poia/approve', {
@@ -703,7 +690,7 @@ class _HomeScreenState extends State<HomeScreen> {
                     'rp_id': rpId,
                     'nonce': nonce,
                     'signature': signature,
-                    'intent_hash': intentHashHex,
+                    'intent_hash': proofHash,
                   });
                   if (response.statusCode == 200) {
                     if (mounted) {
@@ -769,9 +756,11 @@ class _HomeScreenState extends State<HomeScreen> {
               }
             }
 
-            final action = (intent['action'] as String?)?.trim() ?? 'Approve intent';
+            final action =
+                (intent['action'] as String?)?.trim() ?? 'Approve intent';
             final scope = intent['scope'] as Map<String, dynamic>? ?? {};
-            final contextData = intent['context'] as Map<String, dynamic>? ?? {};
+            final contextData =
+                intent['context'] as Map<String, dynamic>? ?? {};
             return AlertDialog(
               title: const Text('Authorize intent'),
               content: SizedBox(
@@ -780,11 +769,13 @@ class _HomeScreenState extends State<HomeScreen> {
                   mainAxisSize: MainAxisSize.min,
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
-                    Text(action, style: const TextStyle(fontWeight: FontWeight.w600)),
+                    Text(action,
+                        style: const TextStyle(fontWeight: FontWeight.w600)),
                     const SizedBox(height: 8),
                     if (scope.isNotEmpty) ...[
                       const Text('Details',
-                          style: TextStyle(color: Colors.white70, fontSize: 12)),
+                          style:
+                              TextStyle(color: Colors.white70, fontSize: 12)),
                       const SizedBox(height: 4),
                       ...scope.entries.map(
                         (entry) => Text(
@@ -824,7 +815,7 @@ class _HomeScreenState extends State<HomeScreen> {
                     foregroundColor: Colors.white,
                   ),
                   onPressed: submitting ? null : () => sendDecision(true),
-                  child: const Text('Approve'),
+                  child: const Text('Sign'),
                 ),
               ],
             );
@@ -964,7 +955,8 @@ class _HomeScreenState extends State<HomeScreen> {
           final baseUrl = _resolveFeedbackBaseUrl();
           if (baseUrl.isEmpty) {
             ScaffoldMessenger.of(context).showSnackBar(
-              const SnackBar(content: Text('No server available for feedback.')),
+              const SnackBar(
+                  content: Text('No server available for feedback.')),
             );
             return;
           }
@@ -986,7 +978,8 @@ class _HomeScreenState extends State<HomeScreen> {
         },
       ),
       body: Container(
-        decoration: const BoxDecoration(gradient: ZtIamColors.backgroundGradient),
+        decoration:
+            const BoxDecoration(gradient: ZtIamColors.backgroundGradient),
         child: ListView(
           padding: const EdgeInsets.all(16),
           children: [
@@ -1096,11 +1089,13 @@ class TotpAccount {
       return '';
     }
     final dotParts = trimmed.split('.');
-    if (dotParts.length == 2 && dotParts[0].toLowerCase() == dotParts[1].toLowerCase()) {
+    if (dotParts.length == 2 &&
+        dotParts[0].toLowerCase() == dotParts[1].toLowerCase()) {
       return dotParts[0];
     }
     final colonParts = trimmed.split(':');
-    if (colonParts.length == 2 && colonParts[0].toLowerCase() == colonParts[1].toLowerCase()) {
+    if (colonParts.length == 2 &&
+        colonParts[0].toLowerCase() == colonParts[1].toLowerCase()) {
       return colonParts[0];
     }
     return trimmed;
@@ -1518,6 +1513,7 @@ class _TotpSetupScreenState extends State<TotpSetupScreen> {
   String _connectivityHint = '';
   bool _allowInsecureTls = false;
   bool _allowHttpDev = false;
+  Map<String, String> _rpBaseUrls = {};
   String _lastEmail = '';
   String _lastRpId = '';
   String _lastIssuer = '';
@@ -1587,13 +1583,26 @@ class _TotpSetupScreenState extends State<TotpSetupScreen> {
   Future<void> _loadNetworkSettings() async {
     final allowInsecureTls = await _settings.loadAllowInsecureTls();
     final allowHttpDev = await _settings.loadAllowHttpDev();
+    final rpBaseUrls = await _settings.loadRpBaseUrls();
     if (!mounted) {
       return;
     }
     setState(() {
       _allowInsecureTls = allowInsecureTls;
       _allowHttpDev = allowHttpDev;
+      _rpBaseUrls = rpBaseUrls;
     });
+  }
+
+  String _coerceBaseUrl(String raw) {
+    final trimmed = raw.trim();
+    if (trimmed.isEmpty) {
+      return '';
+    }
+    if (trimmed.startsWith('http://') || trimmed.startsWith('https://')) {
+      return _normalizeBaseUrl(trimmed);
+    }
+    return _normalizeBaseUrl('${_defaultScheme(trimmed)}://$trimmed');
   }
 
   String _resolveApiBaseUrl(Map<String, dynamic> payload) {
@@ -1700,7 +1709,8 @@ class _TotpSetupScreenState extends State<TotpSetupScreen> {
     if (trimmed.startsWith('{') && trimmed.endsWith('}')) {
       try {
         final decoded = jsonDecode(trimmed);
-        if (decoded is Map<String, dynamic> && decoded['type'] == 'zt_totp_enroll') {
+        if (decoded is Map<String, dynamic> &&
+            decoded['type'] == 'zt_totp_enroll') {
           return decoded;
         }
       } catch (_) {
@@ -1720,7 +1730,8 @@ class _TotpSetupScreenState extends State<TotpSetupScreen> {
           return null;
         }
         final decoded = jsonDecode(response.body);
-        if (decoded is Map<String, dynamic> && decoded['type'] == 'zt_totp_enroll') {
+        if (decoded is Map<String, dynamic> &&
+            decoded['type'] == 'zt_totp_enroll') {
           final enriched = Map<String, dynamic>.from(decoded);
           enriched.putIfAbsent(
             'enroll_url',
@@ -1739,10 +1750,8 @@ class _TotpSetupScreenState extends State<TotpSetupScreen> {
     if (!trimmed.toUpperCase().startsWith(prefix)) {
       return null;
     }
-    final payloadPart = trimmed
-        .substring(prefix.length)
-        .replaceAll(RegExp(r'\s+'), '')
-        .trim();
+    final payloadPart =
+        trimmed.substring(prefix.length).replaceAll(RegExp(r'\s+'), '').trim();
     if (payloadPart.isEmpty) {
       return null;
     }
@@ -1750,7 +1759,8 @@ class _TotpSetupScreenState extends State<TotpSetupScreen> {
       final decodedBytes = base64Url.decode(base64Url.normalize(payloadPart));
       final decodedJson = utf8.decode(decodedBytes);
       final decoded = jsonDecode(decodedJson);
-      if (decoded is Map<String, dynamic> && decoded['type'] == 'zt_totp_enroll') {
+      if (decoded is Map<String, dynamic> &&
+          decoded['type'] == 'zt_totp_enroll') {
         return decoded;
       }
     } catch (_) {
@@ -1851,10 +1861,6 @@ class _TotpSetupScreenState extends State<TotpSetupScreen> {
     }
 
     final detectedBaseUrl = _resolveApiBaseUrl(payload);
-    if (detectedBaseUrl.isNotEmpty) {
-      await _settings.saveApiBaseUrl(detectedBaseUrl);
-      widget.onBaseUrlDetected?.call(detectedBaseUrl);
-    }
     if (mounted) {
       setState(() {
         _detectedBaseUrl = detectedBaseUrl;
@@ -1867,30 +1873,40 @@ class _TotpSetupScreenState extends State<TotpSetupScreen> {
       });
     }
 
+    final keyId = _buildKeyId(rpId, email);
+    if (await _store.containsKeyId(keyId)) {
+      setState(() {
+        _status =
+            'This account is already registered. Remove the existing account before re-enrolling.';
+      });
+      return;
+    }
+
     setState(() {
       _loading = true;
       _status = 'Enrolling device...';
     });
 
     try {
-      final baseUrl = detectedBaseUrl.isNotEmpty
-          ? detectedBaseUrl
-          : widget.fallbackBaseUrl.trim();
-      final recordBaseUrl = baseUrl;
-      if (baseUrl.isEmpty) {
+      final candidateBaseUrls = <String>[];
+      void addCandidate(String value) {
+        final normalized = _coerceBaseUrl(value);
+        if (normalized.isEmpty || candidateBaseUrls.contains(normalized)) {
+          return;
+        }
+        candidateBaseUrls.add(normalized);
+      }
+
+      addCandidate(detectedBaseUrl);
+      addCandidate(_rpBaseUrls[rpId] ?? '');
+      addCandidate(widget.fallbackBaseUrl.trim());
+
+      if (candidateBaseUrls.isEmpty) {
         setState(() {
           _status = 'Enrollment needs a valid server URL.';
         });
         return;
       }
-      if (rpId.isNotEmpty && recordBaseUrl.isNotEmpty) {
-        await _settings.saveRpBaseUrl(rpId, recordBaseUrl);
-      }
-      final enrollClient = ApiClient(
-        baseUrl: baseUrl,
-        allowInsecureTls: _allowInsecureTls,
-      );
-      final keyId = _buildKeyId(rpId, email);
       final publicKey = await _deviceCrypto.generateKeypair(
         rpId: rpId,
         keyId: keyId,
@@ -1904,7 +1920,11 @@ class _TotpSetupScreenState extends State<TotpSetupScreen> {
       final enrollPayload = {
         'email': email,
         'device_label': deviceLabel,
-        'platform': Platform.isIOS ? 'ios' : Platform.isAndroid ? 'android' : 'unknown',
+        'platform': Platform.isIOS
+            ? 'ios'
+            : Platform.isAndroid
+                ? 'android'
+                : 'unknown',
         'rp_id': rpId,
         'rp_display_name': rpDisplayName,
         'key_type': 'p256',
@@ -1913,79 +1933,107 @@ class _TotpSetupScreenState extends State<TotpSetupScreen> {
       if (enrollToken.isNotEmpty) {
         enrollPayload['enroll_token'] = enrollToken;
       }
-      final enrollResponse = await enrollClient.postJson(
-        '/enroll',
-        enrollPayload,
-      );
-      if (enrollResponse.statusCode != 200) {
-        setState(() {
-          _status = 'Enrollment failed: ${enrollResponse.body}';
-        });
-        await _settings.savePendingEnrollment(jsonEncode(payload));
-        setState(() {
-          _pendingPayload = payload;
-        });
-        return;
-      }
+      String? lastError;
+      for (final baseUrl in candidateBaseUrls) {
+        final enrollClient = ApiClient(
+          baseUrl: baseUrl,
+          allowInsecureTls: _allowInsecureTls,
+        );
+        try {
+          final enrollResponse =
+              await enrollClient.postJson('/enroll', enrollPayload);
+          if (enrollResponse.statusCode != 200) {
+            lastError = 'Enrollment failed: ${enrollResponse.body}';
+            continue;
+          }
 
-      final enrollData = jsonDecode(enrollResponse.body) as Map<String, dynamic>;
-      final userId = enrollData['user']['id'] as String;
-      final deviceId = enrollData['device']['id'] as String;
-      setState(() {
-        _lastEmail = email;
-        _lastRpId = rpId;
-        _lastIssuer = issuer;
-        _lastAccount = accountName;
-        _lastUserId = userId;
-        _lastDeviceId = deviceId;
-        _status = 'Registering TOTP...';
-      });
+          final enrollData =
+              jsonDecode(enrollResponse.body) as Map<String, dynamic>;
+          final userId = enrollData['user']['id'] as String;
+          final deviceId = enrollData['device']['id'] as String;
+          setState(() {
+            _lastEmail = email;
+            _lastRpId = rpId;
+            _lastIssuer = issuer;
+            _lastAccount = accountName;
+            _lastUserId = userId;
+            _lastDeviceId = deviceId;
+            _status = 'Registering TOTP...';
+          });
 
-      final totpResponse = await enrollClient.postJson(
-        '/totp/register',
-        {
-          'user_id': userId,
-          'rp_id': rpId,
-          'account_name': accountName,
-          'issuer': issuer,
-        },
-      );
-      if (totpResponse.statusCode != 200) {
-        setState(() {
-          _status = 'TOTP registration failed: ${totpResponse.body}';
-        });
-        return;
-      }
-      final totpData = jsonDecode(totpResponse.body) as Map<String, dynamic>;
-      setState(() {
-        _recoveryCodes =
-            (totpData['recovery_codes'] as List<dynamic>).cast<String>();
-      });
-      if (totpData['otpauth_uri'] != null) {
-        final uri = Uri.parse(totpData['otpauth_uri'] as String);
-        final secret = uri.queryParameters['secret'] ?? '';
-        final label = uri.pathSegments.isNotEmpty ? uri.pathSegments.first : '';
-        if (secret.isNotEmpty) {
-          final record = TotpRecord(
-            issuer: issuer,
-            account: label.isEmpty ? accountName : label,
-            secret: secret,
-            userId: userId,
-            rpId: rpId,
-            deviceId: deviceId,
-            apiBaseUrl: recordBaseUrl,
-            keyId: keyId,
+          final totpResponse = await enrollClient.postJson(
+            '/totp/register',
+            {
+              'user_id': userId,
+              'rp_id': rpId,
+              'account_name': accountName,
+              'issuer': issuer,
+            },
           );
-          await _store.save(record);
-          widget.onRegistered(TotpAccount.fromRecord(record));
+          if (totpResponse.statusCode != 200) {
+            lastError = 'TOTP registration failed: ${totpResponse.body}';
+            continue;
+          }
+          final totpData =
+              jsonDecode(totpResponse.body) as Map<String, dynamic>;
+          setState(() {
+            _recoveryCodes =
+                (totpData['recovery_codes'] as List<dynamic>).cast<String>();
+          });
+          if (totpData['otpauth_uri'] != null) {
+            final uri = Uri.parse(totpData['otpauth_uri'] as String);
+            final secret = uri.queryParameters['secret'] ?? '';
+            final label =
+                uri.pathSegments.isNotEmpty ? uri.pathSegments.first : '';
+            if (secret.isNotEmpty) {
+              final record = TotpRecord(
+                issuer: issuer,
+                account: label.isEmpty ? accountName : label,
+                secret: secret,
+                userId: userId,
+                rpId: rpId,
+                deviceId: deviceId,
+                apiBaseUrl: baseUrl,
+                keyId: keyId,
+              );
+              await _store.save(record);
+              widget.onRegistered(TotpAccount.fromRecord(record));
+            }
+          }
+
+          await _settings.saveApiBaseUrl(baseUrl);
+          widget.onBaseUrlDetected?.call(baseUrl);
+          if (rpId.isNotEmpty) {
+            await _settings.saveRpBaseUrl(rpId, baseUrl);
+            if (mounted) {
+              setState(() {
+                _rpBaseUrls[rpId] = baseUrl;
+              });
+            }
+          }
+
+          setState(() {
+            _status = 'Enrollment complete.';
+          });
+          await _settings.clearPendingEnrollment();
+          setState(() {
+            _pendingPayload = null;
+          });
+          return;
+        } catch (error) {
+          lastError = 'Error: $error';
+          continue;
+        } finally {
+          enrollClient.close();
         }
       }
+
       setState(() {
-        _status = 'Enrollment complete.';
+        _status = lastError ?? 'Enrollment failed.';
       });
-      await _settings.clearPendingEnrollment();
+      await _settings.savePendingEnrollment(jsonEncode(payload));
       setState(() {
-        _pendingPayload = null;
+        _pendingPayload = payload;
       });
     } catch (error) {
       setState(() {
@@ -2175,11 +2223,21 @@ class _LoginApprovalsScreenState extends State<LoginApprovalsScreen> {
     final rpId = pending['rp_id'] as String? ?? '';
     final deviceId = pending['device_id'] as String? ?? '';
     for (final account in widget.accounts) {
-      if (account.rpId == rpId && account.deviceId == deviceId) {
+      if (_sameRpFamily(account.rpId, rpId) && account.deviceId == deviceId) {
         return account;
       }
     }
     return null;
+  }
+
+  bool _sameRpFamily(String left, String right) {
+    final a = left.trim().toLowerCase();
+    final b = right.trim().toLowerCase();
+    if (a == b) {
+      return true;
+    }
+    const aliases = {'zt-iam.com', 'ztiam.com', 'zt-aim.com'};
+    return aliases.contains(a) && aliases.contains(b);
   }
 
   bool _isLocalHost(String host) {
@@ -2218,7 +2276,8 @@ class _LoginApprovalsScreenState extends State<LoginApprovalsScreen> {
       return _coerceBaseUrl(account.apiBaseUrl.trim());
     }
     if (rpId.isNotEmpty && _looksLikeHost(rpId)) {
-      final scheme = widget.allowHttpDev && _isLocalHost(rpId) ? 'http' : 'https';
+      final scheme =
+          widget.allowHttpDev && _isLocalHost(rpId) ? 'http' : 'https';
       return '$scheme://$rpId/api/auth';
     }
     if (widget.fallbackBaseUrl.trim().isNotEmpty) {
@@ -2227,12 +2286,14 @@ class _LoginApprovalsScreenState extends State<LoginApprovalsScreen> {
     return '';
   }
 
-  Future<Map<String, dynamic>?> _accountGet(TotpAccount account, String path) async {
+  Future<Map<String, dynamic>?> _accountGet(
+      TotpAccount account, String path) async {
     final baseUrl = _resolveAccountBaseUrl(account);
     if (baseUrl.isEmpty) {
       return null;
     }
-    final client = ApiClient(baseUrl: baseUrl, allowInsecureTls: widget.allowInsecureTls);
+    final client =
+        ApiClient(baseUrl: baseUrl, allowInsecureTls: widget.allowInsecureTls);
     try {
       final response = await client.get(path);
       if (response.statusCode != 200) {
@@ -2253,7 +2314,8 @@ class _LoginApprovalsScreenState extends State<LoginApprovalsScreen> {
     if (baseUrl.isEmpty) {
       return null;
     }
-    final client = ApiClient(baseUrl: baseUrl, allowInsecureTls: widget.allowInsecureTls);
+    final client =
+        ApiClient(baseUrl: baseUrl, allowInsecureTls: widget.allowInsecureTls);
     try {
       final response = await client.postJson(path, payload);
       if (response.statusCode != 200) {
@@ -2271,35 +2333,35 @@ class _LoginApprovalsScreenState extends State<LoginApprovalsScreen> {
       _status = '';
     });
     try {
-      String? lastError;
-      var hadResponse = false;
-      for (final account in widget.accounts) {
-        if (account.userId.isEmpty) {
-          continue;
-        }
-        try {
-          final data =
-              await _accountGet(account, '/login/pending?user_id=${account.userId}');
-          if (data == null) {
-            continue;
-          }
-          hadResponse = true;
-          if (data['status'] == 'pending') {
-            setState(() {
-              _pending = data;
-            });
-            return;
-          }
-        } catch (error) {
-          lastError = 'Error: $error';
-        }
+      final candidates = widget.accounts
+          .where((account) => account.userId.isNotEmpty)
+          .toList(growable: false);
+      final futures = candidates
+          .map(
+            (account) => _accountGet(
+              account,
+              '/login/pending?user_id=${account.userId}',
+            ).timeout(const Duration(seconds: 2), onTimeout: () => null),
+          )
+          .toList(growable: false);
+      final results = await Future.wait(futures);
+      final hadResponse = results.any((data) => data != null);
+      final pending = results.firstWhere(
+        (data) => data != null && data['status'] == 'pending',
+        orElse: () => null,
+      );
+      if (pending != null) {
+        setState(() {
+          _pending = pending;
+        });
+        return;
       }
       setState(() {
         _pending = null;
         if (hadResponse) {
           _status = 'No pending logins.';
         } else {
-          _status = lastError ?? 'No pending logins.';
+          _status = 'No pending logins.';
         }
       });
     } catch (error) {
@@ -2341,23 +2403,26 @@ class _LoginApprovalsScreenState extends State<LoginApprovalsScreen> {
     });
     try {
       final otp = account.currentCode();
+      final pendingRp = (pending['rp_id'] as String? ?? account.rpId).trim();
+      final pendingDevice =
+          (pending['device_id'] as String? ?? account.deviceId).trim();
       final signature = await widget.deviceCrypto.sign(
-        rpId: account.rpId,
+        rpId: pendingRp,
         nonce: nonce,
-        deviceId: account.deviceId,
+        deviceId: pendingDevice,
         otp: otp,
         keyId: account.keyId.isEmpty ? account.rpId : account.keyId,
       );
       final response = await _accountPost(account, '/login/approve', {
         'login_id': loginId,
-        'device_id': account.deviceId,
-        'rp_id': account.rpId,
+        'device_id': pendingDevice,
+        'rp_id': pendingRp,
         'otp': otp,
         'nonce': nonce,
         'signature': signature,
       });
       setState(() {
-        _status = response == null ? 'Approve failed.' : 'Approve: ok';
+        _status = response == null ? 'Sign failed.' : 'Sign: ok';
       });
       await _refresh();
     } catch (error) {
@@ -2451,7 +2516,6 @@ class _LoginApprovalsScreenState extends State<LoginApprovalsScreen> {
     }
   }
 
-
   @override
   Widget build(BuildContext context) {
     final pending = _pending;
@@ -2462,7 +2526,7 @@ class _LoginApprovalsScreenState extends State<LoginApprovalsScreen> {
         children: [
           const _SectionHeader(
             title: 'Pending login',
-            subtitle: 'Approve or deny login requests.',
+            subtitle: 'Sign or deny login requests.',
           ),
           const SizedBox(height: 16),
           if (pending == null)
@@ -2495,7 +2559,7 @@ class _LoginApprovalsScreenState extends State<LoginApprovalsScreen> {
                       foregroundColor: Colors.white,
                     ),
                     onPressed: _loading ? null : _approve,
-                    child: const Text('Approve'),
+                    child: const Text('Sign'),
                   ),
                 ),
               ],

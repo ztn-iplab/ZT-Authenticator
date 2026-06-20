@@ -11,7 +11,7 @@ from fastapi import APIRouter, Form, HTTPException, Request, Response
 from fastapi.encoders import jsonable_encoder
 
 from app import db
-from app.enrollment import EnrollmentRequest, EnrollmentResponse, enroll
+from app.enrollment import EnrollmentConflictError, EnrollmentRequest, EnrollmentResponse, enroll
 from app.totp_models import (
     RecoveryVerifyRequest,
     RecoveryVerifyResponse,
@@ -143,6 +143,8 @@ async def create_relying_party(payload: RelyingPartyCreate) -> RelyingPartyOut:
 async def enroll_device(payload: EnrollmentRequest) -> EnrollmentResponse:
     try:
         return await enroll(payload)
+    except EnrollmentConflictError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
     except UniqueViolationError:
         raise HTTPException(status_code=409, detail="enrollment conflict")
 
