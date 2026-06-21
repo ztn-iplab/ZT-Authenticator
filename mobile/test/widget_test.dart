@@ -26,4 +26,12 @@ void main() {
     expect(
         source, contains('Previous enrollment expired. Scan a new QR code.'));
   });
+
+  test('PoIA labels expose security-relevant context clearly', () {
+    expect(poiaIntentLabel('user_id'), 'Authorizing user');
+    expect(poiaIntentLabel('workflow_id'), 'Workflow');
+    expect(poiaIntentLabel('rp_id'), 'Relying party');
+    expect(poiaIntentLabel('custom_field'), 'Custom field');
+    expect(poiaIntentValue({'tenant': 'alpha'}), '{"tenant":"alpha"}');
+  });
 }

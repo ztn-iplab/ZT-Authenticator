@@ -23,6 +23,49 @@ void main() {
   runApp(const ZtAuthenticatorApp());
 }
 
+String poiaIntentLabel(String key) {
+  const labels = {
+    'account': 'Account',
+    'amount': 'Amount',
+    'currency': 'Currency',
+    'duration_hours': 'Duration (hours)',
+    'from_account': 'Source account',
+    'key_id': 'Key',
+    'on_behalf_of': 'Acting on behalf of',
+    'patient_id': 'Patient',
+    'project': 'Project',
+    'purpose': 'Purpose',
+    'recipient': 'Recipient',
+    'region': 'Region',
+    'role': 'Role',
+    'rp_id': 'Relying party',
+    'target_user': 'Target user',
+    'tenant': 'Tenant',
+    'to_account': 'Destination account',
+    'user_id': 'Authorizing user',
+    'workflow_id': 'Workflow',
+  };
+  final known = labels[key];
+  if (known != null) {
+    return known;
+  }
+  final words = key.replaceAll('_', ' ').trim();
+  if (words.isEmpty) {
+    return key;
+  }
+  return '${words[0].toUpperCase()}${words.substring(1)}';
+}
+
+String poiaIntentValue(dynamic value) {
+  if (value == null) {
+    return 'Not specified';
+  }
+  if (value is Map || value is List) {
+    return jsonEncode(value);
+  }
+  return value.toString();
+}
+
 // Root app widget: theme + entry screen.
 class ZtAuthenticatorApp extends StatelessWidget {
   const ZtAuthenticatorApp({super.key});
@@ -758,44 +801,61 @@ class _HomeScreenState extends State<HomeScreen> {
             final scope = intent['scope'] as Map<String, dynamic>? ?? {};
             final contextData =
                 intent['context'] as Map<String, dynamic>? ?? {};
+            final visibleContext = contextData.entries
+                .where((entry) => entry.key != 'rp_id')
+                .toList(growable: false);
             return AlertDialog(
               title: const Text('Authorize intent'),
               content: SizedBox(
                 width: double.maxFinite,
-                child: Column(
-                  mainAxisSize: MainAxisSize.min,
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Text(action,
-                        style: const TextStyle(fontWeight: FontWeight.w600)),
-                    const SizedBox(height: 8),
-                    if (scope.isNotEmpty) ...[
-                      const Text('Details',
+                child: SingleChildScrollView(
+                  child: Column(
+                    mainAxisSize: MainAxisSize.min,
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      const Text('Action',
+                          style:
+                              TextStyle(color: Colors.white70, fontSize: 12)),
+                      Text(poiaIntentLabel(action),
+                          style: const TextStyle(fontWeight: FontWeight.w600)),
+                      const SizedBox(height: 12),
+                      if (scope.isNotEmpty) ...[
+                        const Text('Scope',
+                            style:
+                                TextStyle(color: Colors.white70, fontSize: 12)),
+                        const SizedBox(height: 4),
+                        ...scope.entries.map(
+                          (entry) => Text(
+                            '${poiaIntentLabel(entry.key)}: ${poiaIntentValue(entry.value)}',
+                            style: const TextStyle(color: Colors.white70),
+                          ),
+                        ),
+                        const SizedBox(height: 12),
+                      ],
+                      const Text('Authorization context',
                           style:
                               TextStyle(color: Colors.white70, fontSize: 12)),
                       const SizedBox(height: 4),
-                      ...scope.entries.map(
+                      Text('Relying party: $rpId',
+                          style: const TextStyle(color: Colors.white70)),
+                      ...visibleContext.map(
                         (entry) => Text(
-                          '${entry.key}: ${entry.value}',
+                          '${poiaIntentLabel(entry.key)}: ${poiaIntentValue(entry.value)}',
                           style: const TextStyle(color: Colors.white70),
                         ),
                       ),
-                      const SizedBox(height: 8),
+                      if (expiresIn > 0) ...[
+                        const SizedBox(height: 12),
+                        Text('Expires in: ${expiresIn}s',
+                            style: const TextStyle(color: Colors.white70)),
+                      ],
+                      if (status.isNotEmpty) ...[
+                        const SizedBox(height: 8),
+                        Text(status,
+                            style: const TextStyle(color: Colors.white70)),
+                      ],
                     ],
-                    Text('Relying party: $rpId',
-                        style: const TextStyle(color: Colors.white70)),
-                    if (contextData['account'] != null)
-                      Text('Account: ${contextData['account']}',
-                          style: const TextStyle(color: Colors.white70)),
-                    if (expiresIn > 0)
-                      Text('Expires in: ${expiresIn}s',
-                          style: const TextStyle(color: Colors.white70)),
-                    if (status.isNotEmpty) ...[
-                      const SizedBox(height: 8),
-                      Text(status,
-                          style: const TextStyle(color: Colors.white70)),
-                    ],
-                  ],
+                  ),
                 ),
               ),
               actions: [
@@ -812,7 +872,7 @@ class _HomeScreenState extends State<HomeScreen> {
                     foregroundColor: Colors.white,
                   ),
                   onPressed: submitting ? null : () => sendDecision(true),
-                  child: const Text('Sign'),
+                  child: const Text('Sign intent'),
                 ),
               ],
             );
