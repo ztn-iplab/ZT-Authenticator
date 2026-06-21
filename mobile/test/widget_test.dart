@@ -18,4 +18,12 @@ void main() {
       contains("final scheme = uri.scheme.isEmpty ? 'https' : uri.scheme;"),
     );
   });
+
+  test('pending enrollment is expiry checked and token bound', () {
+    final source = File('lib/main.dart').readAsStringSync();
+    expect(source, contains('_isEnrollmentExpired(payload)'));
+    expect(source, contains("'enroll_token': enrollToken"));
+    expect(
+        source, contains('Previous enrollment expired. Scan a new QR code.'));
+  });
 }

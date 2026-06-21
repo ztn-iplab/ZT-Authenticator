@@ -1549,7 +1549,7 @@ class _TotpSetupScreenState extends State<TotpSetupScreen> {
       return;
     }
 
-    await _startEnrollment(payload);
+    await _startEnrollment(_prepareEnrollmentPayload(payload));
   }
 
   @override
@@ -1566,6 +1566,17 @@ class _TotpSetupScreenState extends State<TotpSetupScreen> {
     }
     try {
       final decoded = jsonDecode(raw) as Map<String, dynamic>;
+      if (_enrollmentExpiresAt(decoded) == null ||
+          _isEnrollmentExpired(decoded)) {
+        await _settings.clearPendingEnrollment();
+        if (mounted) {
+          setState(() {
+            _pendingPayload = null;
+            _status = 'Previous enrollment expired. Scan a new QR code.';
+          });
+        }
+        return;
+      }
       if (!mounted) {
         return;
       }
@@ -1575,6 +1586,32 @@ class _TotpSetupScreenState extends State<TotpSetupScreen> {
     } catch (_) {
       await _settings.clearPendingEnrollment();
     }
+  }
+
+  Map<String, dynamic> _prepareEnrollmentPayload(
+    Map<String, dynamic> payload,
+  ) {
+    final prepared = Map<String, dynamic>.from(payload);
+    if (_enrollmentExpiresAt(prepared) == null) {
+      final now = DateTime.now().millisecondsSinceEpoch ~/ 1000;
+      prepared['_client_issued_at'] = now;
+      prepared['_client_expires_at'] = now + 600;
+    }
+    return prepared;
+  }
+
+  int? _enrollmentExpiresAt(Map<String, dynamic> payload) {
+    final raw = payload['expires_at'] ?? payload['_client_expires_at'];
+    if (raw is num) {
+      return raw.toInt();
+    }
+    return int.tryParse(raw?.toString() ?? '');
+  }
+
+  bool _isEnrollmentExpired(Map<String, dynamic> payload) {
+    final expiresAt = _enrollmentExpiresAt(payload);
+    final now = DateTime.now().millisecondsSinceEpoch ~/ 1000;
+    return expiresAt == null || now >= expiresAt;
   }
 
   Future<void> _loadNetworkSettings() async {
@@ -1777,7 +1814,7 @@ class _TotpSetupScreenState extends State<TotpSetupScreen> {
 
     final enrollmentPayload = await _tryParseEnrollmentPayload(raw);
     if (enrollmentPayload != null) {
-      await _startEnrollment(enrollmentPayload);
+      await _startEnrollment(_prepareEnrollmentPayload(enrollmentPayload));
       return;
     }
 
@@ -1835,6 +1872,16 @@ class _TotpSetupScreenState extends State<TotpSetupScreen> {
   }
 
   Future<void> _startEnrollment(Map<String, dynamic> payload) async {
+    if (_isEnrollmentExpired(payload)) {
+      await _settings.clearPendingEnrollment();
+      if (mounted) {
+        setState(() {
+          _pendingPayload = null;
+          _status = 'Enrollment expired. Scan a new QR code.';
+        });
+      }
+      return;
+    }
     final email = (payload['email'] as String?)?.trim() ?? '';
     final rpId = (payload['rp_id'] as String?)?.trim() ?? '';
     final rpDisplayName =
@@ -1962,6 +2009,7 @@ class _TotpSetupScreenState extends State<TotpSetupScreen> {
               'rp_id': rpId,
               'account_name': accountName,
               'issuer': issuer,
+              'enroll_token': enrollToken,
             },
           );
           if (totpResponse.statusCode != 200) {
