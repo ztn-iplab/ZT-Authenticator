@@ -1,6 +1,6 @@
 # ZT-TOTP Protocol Verification (Tamarin)
 
-This folder contains a research-ready Tamarin Prover model for the ZT-TOTP
+This folder contains a Tamarin Prover model for the ZT-TOTP
 protocol used by ZT-Authenticator. The model captures:
 
 - Enrollment (device key + seed registration)
