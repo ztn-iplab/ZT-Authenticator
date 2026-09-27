@@ -10,6 +10,7 @@ class HelpScreen extends StatelessWidget {
 
   Future<void> _copyEmail(BuildContext context) async {
     await Clipboard.setData(const ClipboardData(text: supportEmail));
+    if (!context.mounted) return;
     ScaffoldMessenger.of(context).showSnackBar(
       const SnackBar(content: Text('Support email copied.')),
     );

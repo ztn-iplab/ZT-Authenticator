@@ -99,7 +99,7 @@ class _FeedbackScreenState extends State<FeedbackScreen> {
             ),
             const SizedBox(height: 12),
             DropdownButtonFormField<String>(
-              value: _category,
+              initialValue: _category,
               items: const [
                 DropdownMenuItem(value: 'Bug', child: Text('Bug report')),
                 DropdownMenuItem(value: 'Feature', child: Text('Feature request')),

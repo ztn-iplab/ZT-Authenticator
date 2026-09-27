@@ -18,12 +18,28 @@ class TransferAccountsScreen extends StatefulWidget {
 }
 
 class _TransferAccountsScreenState extends State<TransferAccountsScreen> {
+  // A QR code has a hard physical capacity (a few KB at most). Exporting
+  // every enrolled account as one blob can exceed it once enough accounts
+  // are enrolled, which used to crash the screen with an uncaught
+  // InputTooLongException from the QR encoder. _qrChunkSafeBudget keeps
+  // each chunk comfortably inside that limit (and easy for a phone camera
+  // to actually scan); _qrHardByteLimit is the last-resort guard that skips
+  // rendering entirely rather than ever handing the encoder more than it
+  // can hold.
+  static const int _qrChunkSafeBudget = 900;
+  static const int _qrHardByteLimit = 2900;
+
   final TextEditingController _importController = TextEditingController();
   List<TotpRecord> _records = [];
   String _exportCode = '';
+  List<String> _qrChunks = [];
+  int _qrChunkIndex = 0;
   String _status = '';
   bool _loading = false;
   bool _showCode = false;
+
+  String? _pendingTransferId;
+  final Map<int, List<dynamic>> _pendingParts = {};
 
   @override
   void initState() {
@@ -42,6 +58,8 @@ class _TransferAccountsScreenState extends State<TransferAccountsScreen> {
     setState(() {
       _records = records;
       _exportCode = _buildExportCode(records);
+      _qrChunks = _buildQrChunks(records);
+      _qrChunkIndex = 0;
     });
   }
 
@@ -56,6 +74,52 @@ class _TransferAccountsScreenState extends State<TransferAccountsScreen> {
     };
     final encoded = base64UrlEncode(utf8.encode(jsonEncode(payload))).replaceAll('=', '');
     return 'ZTXFER:$encoded';
+  }
+
+  /// Splits accounts across as many QR-sized parts as needed so export never
+  /// exceeds a QR code's capacity, no matter how many accounts are enrolled.
+  /// Each part carries a shared transfer id plus its own part/total index so
+  /// the scanner can reassemble them in any scan order. The clipboard/paste
+  /// path is unaffected -- it always uses the single, unlimited-size
+  /// _buildExportCode blob above.
+  List<String> _buildQrChunks(List<TotpRecord> records) {
+    if (records.isEmpty) {
+      return [];
+    }
+    final transferId = DateTime.now().microsecondsSinceEpoch.toRadixString(36);
+    final batches = <List<TotpRecord>>[];
+    var current = <TotpRecord>[];
+    for (final record in records) {
+      final candidate = [...current, record];
+      final probe = _encodeTransferPart(transferId, 0, 1, candidate);
+      if (probe.length > _qrChunkSafeBudget && current.isNotEmpty) {
+        batches.add(current);
+        current = [record];
+      } else {
+        current = candidate;
+      }
+    }
+    if (current.isNotEmpty) {
+      batches.add(current);
+    }
+    final total = batches.length;
+    return [
+      for (var i = 0; i < batches.length; i++)
+        _encodeTransferPart(transferId, i + 1, total, batches[i]),
+    ];
+  }
+
+  String _encodeTransferPart(String transferId, int part, int total, List<TotpRecord> records) {
+    final payload = {
+      'type': 'zt_totp_transfer_part',
+      'version': 1,
+      'transfer_id': transferId,
+      'part': part,
+      'total': total,
+      'accounts': records.map((record) => record.normalized().toJson()).toList(),
+    };
+    final encoded = base64UrlEncode(utf8.encode(jsonEncode(payload))).replaceAll('=', '');
+    return 'ZTXFERP:$encoded';
   }
 
   String _formatExportCode(String code) {
@@ -120,27 +184,11 @@ class _TransferAccountsScreenState extends State<TransferAccountsScreen> {
 
     try {
       final payload = _decodePayload(raw);
-      final List<dynamic> accounts = _extractAccounts(payload);
-      if (accounts.isEmpty) {
-        throw const FormatException('No accounts found in transfer payload.');
-      }
-      for (final entry in accounts) {
-        if (entry is! Map<String, dynamic>) {
-          continue;
-        }
-        final record = TotpRecord.fromJson(entry);
-        if (record.issuer.isEmpty || record.account.isEmpty || record.secret.isEmpty) {
-          continue;
-        }
-        await widget.store.save(record);
-      }
-      await _loadRecords();
-      _importController.clear();
-      if (mounted) {
-        setState(() {
-          _status = 'Accounts imported successfully.';
-        });
-        Navigator.of(context).pop(true);
+      if (payload['type'] == 'zt_totp_transfer_part') {
+        await _handleTransferPart(payload);
+      } else {
+        final List<dynamic> accounts = _extractAccounts(payload);
+        await _finishImport(accounts);
       }
     } catch (error) {
       setState(() {
@@ -155,16 +203,82 @@ class _TransferAccountsScreenState extends State<TransferAccountsScreen> {
     }
   }
 
+  /// Accumulates one QR-sized slice of a chunked export (see _buildQrChunks)
+  /// until every part sharing its transfer id has been scanned, then imports
+  /// the merged account list. Parts can arrive in any order; scanning a part
+  /// from a different transfer clears whatever was pending so accounts from
+  /// two unrelated exports never get merged together.
+  Future<void> _handleTransferPart(Map<String, dynamic> payload) async {
+    final transferId = payload['transfer_id']?.toString() ?? '';
+    final part = int.tryParse('${payload['part']}') ?? 0;
+    final total = int.tryParse('${payload['total']}') ?? 0;
+    final accounts = payload['accounts'];
+    if (transferId.isEmpty || part < 1 || total < 1 || accounts is! List<dynamic>) {
+      throw const FormatException('Malformed transfer part.');
+    }
+    if (_pendingTransferId != null && _pendingTransferId != transferId) {
+      _pendingParts.clear();
+    }
+    _pendingTransferId = transferId;
+    _pendingParts[part] = accounts;
+
+    if (_pendingParts.length < total) {
+      _importController.clear();
+      setState(() {
+        _status = 'Received part ${_pendingParts.length} of $total. Tap "Scan QR" again for the next code.';
+      });
+      return;
+    }
+
+    final merged = <dynamic>[
+      for (var i = 1; i <= total; i++) ...?_pendingParts[i],
+    ];
+    _pendingTransferId = null;
+    _pendingParts.clear();
+    await _finishImport(merged);
+  }
+
+  Future<void> _finishImport(List<dynamic> accounts) async {
+    if (accounts.isEmpty) {
+      throw const FormatException('No accounts found in transfer payload.');
+    }
+    for (final entry in accounts) {
+      if (entry is! Map<String, dynamic>) {
+        continue;
+      }
+      final record = TotpRecord.fromJson(entry);
+      if (record.issuer.isEmpty || record.account.isEmpty || record.secret.isEmpty) {
+        continue;
+      }
+      await widget.store.save(record);
+    }
+    await _loadRecords();
+    _importController.clear();
+    if (mounted) {
+      setState(() {
+        _status = 'Accounts imported successfully.';
+      });
+      Navigator.of(context).pop(true);
+    }
+  }
+
   Map<String, dynamic> _decodePayload(String raw) {
     final trimmed = raw.trim();
     if (trimmed.startsWith('{')) {
       return jsonDecode(trimmed) as Map<String, dynamic>;
     }
     final cleaned = trimmed.replaceAll(RegExp(r'\s+'), '');
-    const prefix = 'ZTXFER:';
-    final payloadRaw = cleaned.toUpperCase().startsWith(prefix)
-        ? cleaned.substring(prefix.length)
-        : cleaned;
+    const partPrefix = 'ZTXFERP:';
+    const fullPrefix = 'ZTXFER:';
+    final upperCleaned = cleaned.toUpperCase();
+    String payloadRaw;
+    if (upperCleaned.startsWith(partPrefix)) {
+      payloadRaw = cleaned.substring(partPrefix.length);
+    } else if (upperCleaned.startsWith(fullPrefix)) {
+      payloadRaw = cleaned.substring(fullPrefix.length);
+    } else {
+      payloadRaw = cleaned;
+    }
     final normalized = base64Url.normalize(payloadRaw);
     try {
       final decoded = utf8.decode(base64Url.decode(normalized));
@@ -184,6 +298,88 @@ class _TransferAccountsScreenState extends State<TransferAccountsScreen> {
       return accounts;
     }
     return [];
+  }
+
+  List<Widget> _buildQrSection() {
+    final chunk = _qrChunks[_qrChunkIndex];
+    if (chunk.length > _qrHardByteLimit) {
+      // Last-resort guard: even a single account's data was too large to
+      // fit safely in one QR code (e.g. an unusually long relying-party
+      // URL). Never hand that to the QR encoder -- fall back to the
+      // clipboard/paste path instead of crashing the screen.
+      return const [
+        Text(
+          'This account\'s data is too large for a QR code. Use "Copy transfer code" below and paste it on the other device instead.',
+          style: TextStyle(color: ZtIamColors.textSecondary),
+        ),
+      ];
+    }
+    return [
+      Center(
+        child: Container(
+          padding: const EdgeInsets.all(12),
+          decoration: BoxDecoration(
+            color: Colors.white,
+            borderRadius: BorderRadius.circular(16),
+          ),
+          child: QrImageView(
+            data: chunk,
+            version: QrVersions.auto,
+            size: 200,
+            // Belt-and-suspenders alongside the _qrHardByteLimit check above:
+            // if the QR encoder still rejects the payload for any reason,
+            // show a plain-text fallback instead of an uncaught
+            // InputTooLongException crashing the screen.
+            errorStateBuilder: (context, error) => const SizedBox(
+              width: 200,
+              height: 200,
+              child: Center(
+                child: Padding(
+                  padding: EdgeInsets.all(12),
+                  child: Text(
+                    'Could not render this QR code. Use "Copy transfer code" below instead.',
+                    textAlign: TextAlign.center,
+                    style: TextStyle(color: ZtIamColors.textSecondary),
+                  ),
+                ),
+              ),
+            ),
+          ),
+        ),
+      ),
+      if (_qrChunks.length > 1) ...[
+        const SizedBox(height: 8),
+        Row(
+          mainAxisAlignment: MainAxisAlignment.center,
+          crossAxisAlignment: CrossAxisAlignment.center,
+          children: [
+            IconButton(
+              onPressed: _qrChunkIndex > 0
+                  ? () => setState(() => _qrChunkIndex -= 1)
+                  : null,
+              icon: const Icon(Icons.chevron_left),
+            ),
+            // Expanded so long "QR N of M -- ..." labels (double-digit
+            // chunk counts especially) wrap within the available width
+            // instead of forcing the Row wider than its parent, which
+            // used to overflow off the right edge of the screen.
+            Expanded(
+              child: Text(
+                'QR ${_qrChunkIndex + 1} of ${_qrChunks.length} -- scan each in turn on the receiving device',
+                textAlign: TextAlign.center,
+                style: const TextStyle(color: ZtIamColors.textSecondary),
+              ),
+            ),
+            IconButton(
+              onPressed: _qrChunkIndex < _qrChunks.length - 1
+                  ? () => setState(() => _qrChunkIndex += 1)
+                  : null,
+              icon: const Icon(Icons.chevron_right),
+            ),
+          ],
+        ),
+      ],
+    ];
   }
 
   @override
@@ -212,21 +408,7 @@ class _TransferAccountsScreenState extends State<TransferAccountsScreen> {
                     style: const TextStyle(color: ZtIamColors.textSecondary),
                   ),
                   const SizedBox(height: 12),
-                  if (_exportCode.isNotEmpty)
-                    Center(
-                      child: Container(
-                        padding: const EdgeInsets.all(12),
-                        decoration: BoxDecoration(
-                          color: Colors.white,
-                          borderRadius: BorderRadius.circular(16),
-                        ),
-                        child: QrImageView(
-                          data: _exportCode,
-                          version: QrVersions.auto,
-                          size: 200,
-                        ),
-                      ),
-                    ),
+                  if (_qrChunks.isNotEmpty) ..._buildQrSection(),
                   if (_exportCode.isNotEmpty) const SizedBox(height: 12),
                   ElevatedButton.icon(
                     onPressed: _copyExportCode,

@@ -2,7 +2,7 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:math' as math;
 import 'dart:io';
-
+import 'package:crypto/crypto.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_slidable/flutter_slidable.dart';
 import 'package:flutter/services.dart';
@@ -12,6 +12,7 @@ import 'feedback_screen.dart';
 import 'help_screen.dart';
 import 'how_it_works_screen.dart';
 import 'http_client.dart';
+import 'poia_intent_view.dart';
 import 'qr_scanner_screen.dart';
 import 'settings_screen.dart';
 import 'totp.dart';
@@ -19,8 +20,78 @@ import 'totp_store.dart';
 import 'transfer_accounts_screen.dart';
 import 'zt_theme.dart';
 
+Map<String, dynamic> validatedPoiaIntent(Map<String, dynamic> data) {
+  final raw = data['intent_canonical_json'];
+  final proofRaw = data['proof_payload_json'];
+  if (raw is! String || proofRaw is! String) {
+    throw const FormatException('Missing signed intent bytes');
+  }
+  final proof = jsonDecode(proofRaw) as Map<String, dynamic>;
+  if (sha256.convert(utf8.encode(proofRaw)).toString() != data['intent_hash'] ||
+      base64Url.encode(sha256.convert(utf8.encode(raw)).bytes) != proof['intent_hash'] ||
+      proof['nonce'] != data['nonce'] || proof['expires_at'] != data['expires_at']) {
+    throw const FormatException('Intent digest mismatch');
+  }
+  return Map<String, dynamic>.from(jsonDecode(raw) as Map);
+}
+
+List<List<String>> verifiedDisplayFields(Map<String, dynamic> intent) {
+  final fields = <List<String>>[['Action', intent['action'].toString()]];
+  for (final section in ['scope', 'context', 'constraints']) {
+    final values = intent[section] as Map? ?? {};
+    for (final entry in values.entries) {
+      if (section == 'constraints' && entry.key == 'expires_in_seconds') {
+        // The dialog shows the remaining signed challenge lifetime instead.
+        continue;
+      }
+      if (entry.key == 'referent_commitments') {
+        // Not shown on the mobile approval screen: referent-state
+        // integrity is enforced server-side (execution is refused if the
+        // committed resource's version/hash no longer matches what was
+        // signed), so nothing about RSI's guarantee depends on the human
+        // re-reading these fields here, and they were pure clutter
+        // duplicating the recipient/account fields already shown above.
+        continue;
+      }
+      fields.add([entry.key.toString().replaceAll('_', ' '), entry.value.toString()]);
+    }
+  }
+  return fields;
+}
+
 void main() {
   runApp(const ZtAuthenticatorApp());
+}
+
+String loginApprovalErrorMessage(Object error) {
+  final detail = error.toString().toLowerCase();
+  if (detail.contains('no key') ||
+      detail.contains('sign_failed') ||
+      detail.contains('key permanently invalidated')) {
+    return 'This account no longer has its enrolled device signing key. '
+        'Remove this account from ZT-Authenticator and enroll it again.';
+  }
+  return 'The login request could not be signed. Check the connection and '
+      'try again.';
+}
+
+String loginApprovalResponseMessage(Map<String, dynamic>? response) {
+  final reason = response?['reason']?.toString() ?? '';
+  switch (reason) {
+    case 'expired':
+    case 'not_pending':
+      return 'This login request expired. Start a new login and try again.';
+    case 'invalid_device_proof':
+      return 'The device signing key no longer matches this enrollment. '
+          'Remove this account from ZT-Authenticator and enroll it again.';
+    case 'invalid_otp':
+    case 'otp_mismatch':
+      return 'The one-time code changed before approval. Start a new login '
+          'and sign the fresh request.';
+    default:
+      return 'The server did not accept the login signature. Start a new '
+          'login and try again.';
+  }
 }
 
 String poiaIntentLabel(String key) {
@@ -184,42 +255,6 @@ class _HomeScreenState extends State<HomeScreen> {
     _loadSettings();
   }
 
-  Future<void> _updateAllAccountsBaseUrl(String baseUrl) async {
-    final trimmed = baseUrl.trim();
-    if (trimmed.isEmpty) {
-      return;
-    }
-    final normalized =
-        trimmed.startsWith('http://') || trimmed.startsWith('https://')
-            ? trimmed
-            : 'https://$trimmed';
-    final accounts = List<TotpAccount>.from(_totpAccounts);
-    for (final account in accounts) {
-      final updated = TotpAccount(
-        issuer: account.issuer,
-        account: account.account,
-        secret: account.secret,
-        userId: account.userId,
-        rpId: account.rpId,
-        deviceId: account.deviceId,
-        apiBaseUrl: normalized,
-        keyId: account.keyId,
-      );
-      await _store.delete(account.toRecord());
-      await _store.save(updated.toRecord());
-      final idx = _totpAccounts.indexOf(account);
-      if (idx >= 0) {
-        _totpAccounts[idx] = updated;
-      }
-    }
-    if (!mounted) {
-      return;
-    }
-    setState(() {
-      _fallbackApiBaseUrl = normalized;
-    });
-  }
-
   Future<void> _showAccountInfo() async {
     final accounts = List<TotpAccount>.from(_totpAccounts);
     await showDialog<void>(
@@ -249,7 +284,7 @@ class _HomeScreenState extends State<HomeScreen> {
                           if (account.isNotEmpty)
                             Text(
                               account,
-                              style: const TextStyle(color: Colors.white70),
+                              style: const TextStyle(color: ZtIamColors.textSecondary),
                             ),
                         ],
                       );
@@ -350,7 +385,7 @@ class _HomeScreenState extends State<HomeScreen> {
             ),
             ElevatedButton(
               style: ElevatedButton.styleFrom(
-                backgroundColor: Colors.redAccent,
+                backgroundColor: ZtIamColors.danger,
                 foregroundColor: Colors.white,
               ),
               onPressed: () => Navigator.of(context).pop(true),
@@ -445,6 +480,18 @@ class _HomeScreenState extends State<HomeScreen> {
         .firstWhere((value) => value.isNotEmpty, orElse: () => '');
   }
 
+  Future<Map<String, String>> _pollHeaders(TotpAccount account, String path) async {
+    final random = math.Random.secure();
+    final nonce = List.generate(24, (_) => random.nextInt(256).toRadixString(16).padLeft(2, '0')).join();
+    final stamp = (DateTime.now().millisecondsSinceEpoch ~/ 1000).toString();
+    final signature = await _deviceCrypto.sign(
+      rpId: account.rpId, deviceId: account.deviceId, nonce: nonce,
+      otp: 'poll-v1:$path:${account.userId}:$stamp',
+      keyId: account.keyId.isEmpty ? account.rpId : account.keyId,
+    );
+    return {'X-PoIA-Poll-Nonce': nonce, 'X-PoIA-Poll-Time': stamp, 'X-PoIA-Poll-Signature': signature};
+  }
+
   Future<Map<String, dynamic>?> _accountGet(
     TotpAccount account,
     String path,
@@ -456,29 +503,44 @@ class _HomeScreenState extends State<HomeScreen> {
     final client =
         ApiClient(baseUrl: baseUrl, allowInsecureTls: _allowInsecureTls);
     try {
-      final response = await client.get(path);
+      final headers = path.startsWith('/login/pending?')
+          ? await _pollHeaders(account, '/api/auth/login/pending') : null;
+      final response = await client.get(path, headers: headers).timeout(const Duration(seconds: 5));
       if (response.statusCode != 200) {
         return null;
       }
       return jsonDecode(response.body) as Map<String, dynamic>;
+    } catch (_) {
+      // One unreachable account must not abort pending requests for others.
+      return null;
     } finally {
       client.close();
     }
   }
 
-  Future<void> _accountPost(
+  Future<Map<String, dynamic>?> _accountPost(
     TotpAccount account,
     String path,
     Map<String, dynamic> payload,
   ) async {
     final baseUrl = _resolveAccountBaseUrl(account);
     if (baseUrl.isEmpty) {
-      return;
+      return null;
     }
     final client =
         ApiClient(baseUrl: baseUrl, allowInsecureTls: _allowInsecureTls);
     try {
-      await client.postJson(path, payload);
+      final response = await client.postJson(path, payload);
+      Map<String, dynamic>? body;
+      try {
+        body = jsonDecode(response.body) as Map<String, dynamic>;
+      } on FormatException {
+        body = null;
+      }
+      if (response.statusCode != 200) {
+        return body ?? {'reason': 'http_${response.statusCode}'};
+      }
+      return body;
     } finally {
       client.close();
     }
@@ -503,8 +565,12 @@ class _HomeScreenState extends State<HomeScreen> {
           .map(
             (account) => _accountGet(
               account,
-              '/login/pending?user_id=${account.userId}',
-            ).timeout(const Duration(seconds: 2), onTimeout: () => null),
+              '/login/pending?${Uri(queryParameters: {
+                    'user_id': account.userId,
+                    'device_id': account.deviceId,
+                    'rp_id': account.rpId,
+                  }).query}',
+            ),
           )
           .toList(growable: false);
       final results = await Future.wait(futures);
@@ -524,7 +590,7 @@ class _HomeScreenState extends State<HomeScreen> {
             nonce.isEmpty) {
           continue;
         }
-        if (_approvalDialogOpen || loginId == _lastLoginId) {
+        if (_approvalDialogOpen || _poiaDialogOpen || loginId == _lastLoginId) {
           continue;
         }
         _lastLoginId = loginId;
@@ -532,14 +598,25 @@ class _HomeScreenState extends State<HomeScreen> {
           return;
         }
         _approvalDialogOpen = true;
-        await _showApprovalDialog(
-          account: account,
-          loginId: loginId,
-          nonce: nonce,
-          pendingRp: pendingRp,
-          pendingDevice: pendingDevice,
-        );
-        _approvalDialogOpen = false;
+        try {
+          final completed = await _showApprovalDialog(
+            account: account,
+            loginId: loginId,
+            nonce: nonce,
+            pendingRp: pendingRp,
+            pendingDevice: pendingDevice,
+          );
+          if (!completed) {
+            _lastLoginId = '';
+          }
+        } catch (_) {
+          _lastLoginId = '';
+        } finally {
+          // Always release the flag, even if the dialog failed to show or
+          // throw mid-flow -- otherwise every later login request is
+          // silently skipped for the rest of the app session.
+          _approvalDialogOpen = false;
+        }
         return;
       }
     } finally {
@@ -547,71 +624,179 @@ class _HomeScreenState extends State<HomeScreen> {
     }
   }
 
-  Future<void> _showApprovalDialog({
+  Future<bool> _showApprovalDialog({
     required TotpAccount account,
     required String loginId,
     required String nonce,
     required String pendingRp,
     required String pendingDevice,
   }) async {
-    await showDialog<void>(
-      context: context,
-      barrierDismissible: false,
-      builder: (context) {
-        return AlertDialog(
-          title: const Text('Sign login request?'),
-          content: Text('Account: ${account.account}\nRP: ${account.rpId}'),
-          actions: [
-            ElevatedButton(
-              style: ElevatedButton.styleFrom(
-                backgroundColor: Colors.redAccent,
-                foregroundColor: Colors.white,
-              ),
-              onPressed: () async {
-                await _accountPost(account, '/login/deny', {
-                  'login_id': loginId,
-                  'reason': 'user_denied',
+    return await showDialog<bool>(
+          context: context,
+          barrierDismissible: false,
+          builder: (context) {
+            var submitting = false;
+            String? status;
+            return StatefulBuilder(builder: (context, setDialogState) {
+              Future<void> sendDecision(bool approve) async {
+                setDialogState(() {
+                  submitting = true;
+                  status = approve
+                      ? 'Signing login request...'
+                      : 'Signing denial...';
                 });
-                if (mounted) {
-                  Navigator.of(context).pop();
+                try {
+                  final otp =
+                      approve ? account.currentCode() : 'login-deny:$loginId';
+                  final signature = await _deviceCrypto.sign(
+                    rpId: pendingRp,
+                    nonce: nonce,
+                    deviceId: pendingDevice,
+                    otp: otp,
+                    keyId: account.keyId.isEmpty ? account.rpId : account.keyId,
+                  );
+                  if (signature.isEmpty) {
+                    throw StateError('Device returned an empty signature.');
+                  }
+                  final response = await _accountPost(
+                    account,
+                    approve ? '/login/approve' : '/login/deny',
+                    {
+                      'login_id': loginId,
+                      'device_id': pendingDevice,
+                      'rp_id': pendingRp,
+                      if (approve) 'otp': otp,
+                      'nonce': nonce,
+                      'signature': signature,
+                      if (!approve) 'reason': 'user_denied',
+                    },
+                  );
+                  final responseStatus = response?['status'];
+                  final accepted = approve
+                      ? responseStatus == 'ok'
+                      : responseStatus == 'denied';
+                  if (accepted && context.mounted) {
+                    Navigator.of(context).pop(true);
+                    return;
+                  }
+                  if (context.mounted) {
+                    setDialogState(() {
+                      status = loginApprovalResponseMessage(response);
+                    });
+                  }
+                } catch (error) {
+                  if (context.mounted) {
+                    setDialogState(() {
+                      status = loginApprovalErrorMessage(error);
+                    });
+                  }
+                } finally {
+                  if (context.mounted) {
+                    setDialogState(() {
+                      submitting = false;
+                    });
+                  }
                 }
-              },
-              child: const Text('Deny'),
-            ),
-            ElevatedButton(
-              style: ElevatedButton.styleFrom(
-                backgroundColor: ZtIamColors.accentGreen,
-                foregroundColor: Colors.white,
-              ),
-              onPressed: () async {
-                final otp = account.currentCode();
-                final signature = await _deviceCrypto.sign(
-                  rpId: pendingRp,
-                  nonce: nonce,
-                  deviceId: pendingDevice,
-                  otp: otp,
-                  keyId: account.keyId.isEmpty ? account.rpId : account.keyId,
-                );
-                if (signature.isNotEmpty) {
-                  await _accountPost(account, '/login/approve', {
-                    'login_id': loginId,
-                    'device_id': pendingDevice,
-                    'rp_id': pendingRp,
-                    'otp': otp,
-                    'nonce': nonce,
-                    'signature': signature,
-                  });
-                }
-                if (mounted) {
-                  Navigator.of(context).pop();
-                }
-              },
-              child: const Text('Sign'),
-            ),
-          ],
-        );
-      },
-    );
+              }
+
+              return AlertDialog(
+                title: const Text('Sign login request?'),
+                scrollable: true,
+                insetPadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 24),
+                content: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    // Same visual language as the PoIA intent dialog: a
+                    // simple person avatar for who is signing in, larger
+                    // identity text, and a muted relying-party line.
+                    Row(
+                      crossAxisAlignment: CrossAxisAlignment.center,
+                      children: [
+                        CircleAvatar(
+                          radius: 20,
+                          backgroundColor:
+                              ZtIamColors.accentBlue.withValues(alpha: 0.22),
+                          child: const Icon(Icons.person,
+                              color: ZtIamColors.accentBlue, size: 22),
+                        ),
+                        const SizedBox(width: 12),
+                        Expanded(
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              const Text('Signing in as',
+                                  style: TextStyle(
+                                      color: ZtIamColors.textSecondary, fontSize: 12)),
+                              const SizedBox(height: 2),
+                              Text(
+                                account.displayAccount(),
+                                style: const TextStyle(
+                                  fontSize: 20,
+                                  fontWeight: FontWeight.w700,
+                                  color: ZtIamColors.textPrimary,
+                                ),
+                              ),
+                            ],
+                          ),
+                        ),
+                      ],
+                    ),
+                    const SizedBox(height: 14),
+                    Row(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        const Icon(Icons.verified_user_outlined,
+                            size: 18, color: ZtIamColors.accentSoft),
+                        const SizedBox(width: 8),
+                        Expanded(
+                          child: Text(
+                            'Relying party: $pendingRp',
+                            style: const TextStyle(
+                                fontSize: 15, color: ZtIamColors.textSecondary),
+                          ),
+                        ),
+                      ],
+                    ),
+                    if (status != null) ...[
+                      const SizedBox(height: 14),
+                      Text(status!,
+                          key: const Key('login-approval-status'),
+                          style: const TextStyle(color: ZtIamColors.textSecondary)),
+                    ],
+                    const SizedBox(height: 14),
+                    const Divider(color: ZtIamColors.divider, height: 1),
+                  ],
+                ),
+                actions: [
+                  TextButton(
+                    onPressed: submitting
+                        ? null
+                        : () => Navigator.of(context).pop(false),
+                    child: const Text('Close'),
+                  ),
+                  ElevatedButton(
+                    style: ElevatedButton.styleFrom(
+                      backgroundColor: ZtIamColors.danger,
+                      foregroundColor: Colors.white,
+                    ),
+                    onPressed: submitting ? null : () => sendDecision(false),
+                    child: const Text('Deny'),
+                  ),
+                  ElevatedButton(
+                    style: ElevatedButton.styleFrom(
+                      backgroundColor: ZtIamColors.accentGreen,
+                      foregroundColor: Colors.white,
+                    ),
+                    onPressed: submitting ? null : () => sendDecision(true),
+                    child: const Text('Sign'),
+                  ),
+                ],
+              );
+            });
+          },
+        ) ??
+        false;
   }
 
   String _resolvePoiaBaseUrl(TotpAccount account) {
@@ -623,11 +808,27 @@ class _HomeScreenState extends State<HomeScreen> {
     return '${uri.scheme}://${uri.authority}';
   }
 
+  bool _poiaPollInFlight = false;
+
   Future<void> _pollPoiaApprovals() async {
+    if (_poiaPollInFlight || !mounted) return;
+    _poiaPollInFlight = true;
+    try {
+      await _pollPoiaApprovalAccounts();
+    } finally {
+      _poiaPollInFlight = false;
+    }
+  }
+
+  Future<void> _pollPoiaApprovalAccounts() async {
     if (_totpAccounts.isEmpty) {
       return;
     }
-    for (final account in _totpAccounts) {
+    final accounts = List<TotpAccount>.of(_totpAccounts);
+    final pending = await Future.wait(accounts.map(_pendingPoiaForAccount));
+    for (var index = 0; index < accounts.length; index++) {
+      final account = accounts[index];
+      if (!mounted) return;
       if (account.userId.isEmpty ||
           account.deviceId.isEmpty ||
           account.rpId.isEmpty) {
@@ -637,15 +838,9 @@ class _HomeScreenState extends State<HomeScreen> {
       if (baseUrl.isEmpty) {
         continue;
       }
-      final client =
-          ApiClient(baseUrl: baseUrl, allowInsecureTls: _allowInsecureTls);
       try {
-        final response =
-            await client.get('/api/poia/pending?user_id=${account.userId}');
-        if (response.statusCode != 200) {
-          continue;
-        }
-        final data = jsonDecode(response.body) as Map<String, dynamic>;
+        final data = pending[index];
+        if (data == null) continue;
         if (data['status'] != 'pending') {
           continue;
         }
@@ -653,17 +848,16 @@ class _HomeScreenState extends State<HomeScreen> {
         final nonce = data['nonce']?.toString() ?? '';
         final proofHash = data['intent_hash']?.toString() ?? '';
         final rpId = (data['rp_id'] as String?)?.trim() ?? account.rpId;
-        final intentRaw = data['intent'];
+        final intentRaw = validatedPoiaIntent(data);
         if (intentId.isEmpty ||
             nonce.isEmpty ||
-            proofHash.isEmpty ||
-            intentRaw is! Map) {
+            proofHash.isEmpty) {
           continue;
         }
         if (rpId.isNotEmpty && rpId != account.rpId) {
           continue;
         }
-        if (_poiaDialogOpen || intentId == _lastPoiaIntentId) {
+        if (_poiaDialogOpen || _approvalDialogOpen || intentId == _lastPoiaIntentId) {
           continue;
         }
         _lastPoiaIntentId = intentId;
@@ -671,22 +865,60 @@ class _HomeScreenState extends State<HomeScreen> {
           return;
         }
         _poiaDialogOpen = true;
-        await _showPoiaApprovalDialog(
-          account: account,
-          intentId: intentId,
-          intent: Map<String, dynamic>.from(intentRaw),
-          nonce: nonce,
-          proofHash: proofHash,
-          rpId: rpId,
-          baseUrl: baseUrl,
-          expiresIn: (data['expires_in'] as num?)?.toInt() ?? 0,
-        );
-        _poiaDialogOpen = false;
+        try {
+          await _showPoiaApprovalDialog(
+            account: account,
+            intentId: intentId,
+            intent: Map<String, dynamic>.from(intentRaw),
+            nonce: nonce,
+            proofHash: proofHash,
+            rpId: rpId,
+            baseUrl: baseUrl,
+            expiresAt: (data['expires_at'] as num).toInt(),
+            displayFields: verifiedDisplayFields(intentRaw),
+            // Presentation-only metadata alongside the verified intent (a
+            // sibling of intent/display_fields/signing_backend in the
+            // /api/poia/pending response), never part of the signed payload
+            // -- purely selects the study display arm. Defaults to
+            // 'redesigned' for every real (non-study) user and any older
+            // response that doesn't send this field.
+            displayVariant: data['display_variant'] as String? ?? 'redesigned',
+          );
+        } finally {
+          // Always release the flag, even if the dialog failed to show or
+          // throw mid-flow -- otherwise every later intent-signing request
+          // is silently skipped for the rest of the app session.
+          _poiaDialogOpen = false;
+        }
       } catch (_) {
+        _lastPoiaIntentId = '';
         continue;
-      } finally {
-        client.close();
       }
+    }
+  }
+
+  Future<Map<String, dynamic>?> _pendingPoiaForAccount(TotpAccount account) async {
+    if (account.userId.isEmpty || account.deviceId.isEmpty || account.rpId.isEmpty) {
+      return null;
+    }
+    final baseUrl = _resolvePoiaBaseUrl(account);
+    if (baseUrl.isEmpty) return null;
+    final client = ApiClient(baseUrl: baseUrl, allowInsecureTls: _allowInsecureTls);
+    try {
+      final query = Uri(queryParameters: {
+        'user_id': account.userId,
+        'device_id': account.deviceId,
+        'rp_id': account.rpId,
+      }).query;
+      final headers = await _pollHeaders(account, '/api/poia/pending');
+      final response = await client.get('/api/poia/pending?$query', headers: headers)
+          .timeout(const Duration(seconds: 5));
+      if (response.statusCode != 200) return null;
+      return jsonDecode(response.body) as Map<String, dynamic>;
+    } catch (_) {
+      return null;
+    } finally {
+      client.close();
     }
   }
 
@@ -698,7 +930,9 @@ class _HomeScreenState extends State<HomeScreen> {
     required String proofHash,
     required String rpId,
     required String baseUrl,
-    required int expiresIn,
+    required int expiresAt,
+    List<dynamic> displayFields = const [],
+    String displayVariant = 'redesigned',
   }) async {
     await showDialog<void>(
       context: context,
@@ -711,7 +945,7 @@ class _HomeScreenState extends State<HomeScreen> {
             Future<void> sendDecision(bool approve) async {
               setDialogState(() {
                 submitting = true;
-                status = approve ? 'Sending approval...' : 'Sending denial...';
+                status = approve ? 'Signing intent...' : 'Sending denial...';
               });
               final client = ApiClient(
                   baseUrl: baseUrl, allowInsecureTls: _allowInsecureTls);
@@ -721,7 +955,7 @@ class _HomeScreenState extends State<HomeScreen> {
                     rpId: rpId,
                     nonce: nonce,
                     deviceId: account.deviceId,
-                    otp: proofHash,
+                    otp: 'poia-approve:$proofHash',
                     keyId: account.keyId.isEmpty ? account.rpId : account.keyId,
                   );
                   final response = await client.postJson('/api/poia/approve', {
@@ -733,35 +967,47 @@ class _HomeScreenState extends State<HomeScreen> {
                     'intent_hash': proofHash,
                   });
                   if (response.statusCode == 200) {
-                    if (mounted) {
+                    if (context.mounted) {
                       Navigator.of(context).pop();
                     }
                     return;
                   }
                   final body = response.body.trim();
-                  String message = 'Approval failed.';
+                  String message = 'Intent signing failed.';
                   if (body.isNotEmpty) {
                     try {
                       final decoded = jsonDecode(body);
                       if (decoded is Map && decoded['reason'] != null) {
-                        message = 'Approval failed: ${decoded['reason']}';
+                        message = 'Intent signing failed: ${decoded['reason']}';
                       } else {
-                        message = 'Approval failed: $body';
+                        message = 'Intent signing failed: $body';
                       }
                     } catch (_) {
-                      message = 'Approval failed: $body';
+                      message = 'Intent signing failed: $body';
                     }
                   }
                   setDialogState(() {
                     status = message;
                   });
                 } else {
+                  final signature = await _deviceCrypto.sign(
+                    rpId: rpId,
+                    nonce: nonce,
+                    deviceId: account.deviceId,
+                    otp: 'poia-deny:$proofHash',
+                    keyId: account.keyId.isEmpty ? account.rpId : account.keyId,
+                  );
                   final response = await client.postJson('/api/poia/deny', {
                     'intent_id': intentId,
+                    'device_id': account.deviceId,
+                    'rp_id': rpId,
+                    'nonce': nonce,
+                    'signature': signature,
+                    'intent_hash': proofHash,
                     'reason': 'user_denied',
                   });
                   if (response.statusCode == 200) {
-                    if (mounted) {
+                    if (context.mounted) {
                       Navigator.of(context).pop();
                     }
                     return;
@@ -785,27 +1031,33 @@ class _HomeScreenState extends State<HomeScreen> {
                   });
                 }
               } catch (error) {
-                setDialogState(() {
-                  status = 'Error: $error';
-                });
+                if (context.mounted) {
+                  setDialogState(() { status = 'Error: $error'; });
+                }
               } finally {
                 client.close();
-                setDialogState(() {
-                  submitting = false;
-                });
+                if (context.mounted) {
+                  setDialogState(() { submitting = false; });
+                }
               }
             }
 
             final action =
-                (intent['action'] as String?)?.trim() ?? 'Approve intent';
+                (intent['action'] as String?)?.trim() ?? 'Sign intent';
             final scope = intent['scope'] as Map<String, dynamic>? ?? {};
             final contextData =
                 intent['context'] as Map<String, dynamic>? ?? {};
             final visibleContext = contextData.entries
                 .where((entry) => entry.key != 'rp_id')
                 .toList(growable: false);
+            final resolvedFields = displayFields
+                .whereType<List<dynamic>>()
+                .where((pair) => pair.length == 2)
+                .map((pair) => MapEntry(pair[0].toString(), pair[1].toString()))
+                .toList(growable: false);
             return AlertDialog(
-              title: const Text('Authorize intent'),
+              title: const Text('Sign intent'),
+              insetPadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 24),
               content: SizedBox(
                 width: double.maxFinite,
                 child: SingleChildScrollView(
@@ -813,47 +1065,65 @@ class _HomeScreenState extends State<HomeScreen> {
                     mainAxisSize: MainAxisSize.min,
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
-                      const Text('Action',
-                          style:
-                              TextStyle(color: Colors.white70, fontSize: 12)),
-                      Text(poiaIntentLabel(action),
-                          style: const TextStyle(fontWeight: FontWeight.w600)),
-                      const SizedBox(height: 12),
-                      if (scope.isNotEmpty) ...[
-                        const Text('Scope',
+                      if (resolvedFields.isNotEmpty) ...[
+                        // Every value below comes straight from
+                        // verifiedDisplayFields(intentRaw) (see the call
+                        // site above and its definition near the top of
+                        // this file), which is itself derived only from the
+                        // hash-verified intent object. PoiaIntentSummary is
+                        // purely a re-layout of that same data -- it never
+                        // fetches or substitutes a different value.
+                        PoiaIntentSummary(
+                          displayFields: resolvedFields,
+                          youLabel: account.displayAccount().trim().isEmpty
+                              ? 'You'
+                              : account.displayAccount().trim(),
+                          displayVariant: displayVariant,
+                        ),
+                      ] else ...[
+                        const Text('Action',
                             style:
-                                TextStyle(color: Colors.white70, fontSize: 12)),
+                                TextStyle(color: ZtIamColors.textSecondary, fontSize: 12)),
+                        Text(poiaIntentLabel(action),
+                            style: const TextStyle(fontWeight: FontWeight.w600)),
+                        const SizedBox(height: 12),
+                        if (scope.isNotEmpty) ...[
+                          const Text('Scope',
+                              style: TextStyle(
+                                  color: ZtIamColors.textSecondary, fontSize: 12)),
+                          const SizedBox(height: 4),
+                          ...scope.entries.map(
+                            (entry) => Text(
+                              '${poiaIntentLabel(entry.key)}: ${poiaIntentValue(entry.value)}',
+                              style: const TextStyle(color: ZtIamColors.textSecondary),
+                            ),
+                          ),
+                          const SizedBox(height: 12),
+                        ],
+                        const Text('Authorization context',
+                            style: TextStyle(
+                                color: ZtIamColors.textSecondary, fontSize: 12)),
                         const SizedBox(height: 4),
-                        ...scope.entries.map(
+                        Text('Relying party: $rpId',
+                            style: const TextStyle(color: ZtIamColors.textSecondary)),
+                        ...visibleContext.map(
                           (entry) => Text(
                             '${poiaIntentLabel(entry.key)}: ${poiaIntentValue(entry.value)}',
-                            style: const TextStyle(color: Colors.white70),
+                            style: const TextStyle(color: ZtIamColors.textSecondary),
                           ),
                         ),
-                        const SizedBox(height: 12),
                       ],
-                      const Text('Authorization context',
-                          style:
-                              TextStyle(color: Colors.white70, fontSize: 12)),
-                      const SizedBox(height: 4),
-                      Text('Relying party: $rpId',
-                          style: const TextStyle(color: Colors.white70)),
-                      ...visibleContext.map(
-                        (entry) => Text(
-                          '${poiaIntentLabel(entry.key)}: ${poiaIntentValue(entry.value)}',
-                          style: const TextStyle(color: Colors.white70),
-                        ),
-                      ),
-                      if (expiresIn > 0) ...[
-                        const SizedBox(height: 12),
-                        Text('Expires in: ${expiresIn}s',
-                            style: const TextStyle(color: Colors.white70)),
-                      ],
+                      const SizedBox(height: 14),
+                      PoiaExpiryCountdown(expiresAt: expiresAt),
                       if (status.isNotEmpty) ...[
                         const SizedBox(height: 8),
                         Text(status,
-                            style: const TextStyle(color: Colors.white70)),
+                            style: const TextStyle(color: ZtIamColors.textSecondary)),
                       ],
+                      // Keeps the signing/authorization action visually
+                      // separate from the transaction details above it.
+                      const SizedBox(height: 16),
+                      const Divider(color: ZtIamColors.divider, height: 1),
                     ],
                   ),
                 ),
@@ -861,14 +1131,14 @@ class _HomeScreenState extends State<HomeScreen> {
               actions: [
                 TextButton(
                   style: TextButton.styleFrom(
-                    foregroundColor: Colors.redAccent,
+                    foregroundColor: ZtIamColors.danger,
                   ),
                   onPressed: submitting ? null : () => sendDecision(false),
                   child: const Text('Deny'),
                 ),
                 ElevatedButton(
                   style: ElevatedButton.styleFrom(
-                    backgroundColor: Colors.green.shade600,
+                    backgroundColor: ZtIamColors.accentGreen,
                     foregroundColor: Colors.white,
                   ),
                   onPressed: submitting ? null : () => sendDecision(true),
@@ -964,7 +1234,8 @@ class _HomeScreenState extends State<HomeScreen> {
               onTap: _showAccountInfo,
               borderRadius: BorderRadius.circular(20),
               child: CircleAvatar(
-                backgroundColor: ZtIamColors.card,
+                backgroundColor: ZtIamColors.accentBlue,
+                foregroundColor: Colors.white,
                 child: Text(profileInitial),
               ),
             ),
@@ -1064,7 +1335,7 @@ class _HomeScreenState extends State<HomeScreen> {
                 child: Center(
                   child: Text(
                     'No matching accounts found.',
-                    style: TextStyle(color: Colors.white70),
+                    style: TextStyle(color: ZtIamColors.textSecondary),
                   ),
                 ),
               )
@@ -1122,6 +1393,16 @@ class TotpAccount {
   final String deviceId;
   final String apiBaseUrl;
   final String keyId;
+
+  String displayAccount() {
+    final value = account.trim();
+    for (final prefix in [issuer.trim(), displayIssuer(), rpId.trim()]) {
+      if (prefix.isNotEmpty && value.toLowerCase().startsWith('${prefix.toLowerCase()}:')) {
+        return value.substring(prefix.length + 1).trim();
+      }
+    }
+    return value;
+  }
 
   String displayIssuer() {
     final issuerValue = issuer.trim();
@@ -1242,7 +1523,7 @@ class _AccountRow extends StatelessWidget {
           ),
           SlidableAction(
             onPressed: (_) => onDelete(),
-            backgroundColor: Colors.redAccent,
+            backgroundColor: ZtIamColors.danger,
             foregroundColor: Colors.white,
             icon: Icons.delete,
           ),
@@ -1263,7 +1544,7 @@ class _AccountTile extends StatelessWidget {
     final code = entry.currentCode();
     final progress = entry.progress();
     final issuer = entry.displayIssuer();
-    final account = entry.account.trim();
+    final account = entry.displayAccount();
 
     return Padding(
       padding: const EdgeInsets.only(bottom: 4),
@@ -1274,42 +1555,19 @@ class _AccountTile extends StatelessWidget {
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                Row(
-                  children: [
-                    Flexible(
-                      flex: 0,
-                      child: Text(
-                        issuer,
-                        style: const TextStyle(
-                          fontSize: 14,
-                          fontWeight: FontWeight.w600,
-                          color: Colors.white,
-                        ),
-                        maxLines: 1,
-                        overflow: TextOverflow.ellipsis,
-                      ),
-                    ),
-                    if (account.isNotEmpty) ...[
-                      const SizedBox(width: 6),
-                      const Text(
-                        '•',
-                        style: TextStyle(color: Colors.white54, fontSize: 12),
-                      ),
-                      const SizedBox(width: 6),
-                      Expanded(
-                        child: Text(
-                          account,
-                          style: const TextStyle(
-                            fontSize: 12,
-                            color: Colors.white70,
-                            fontWeight: FontWeight.w500,
-                          ),
-                          maxLines: 1,
-                          overflow: TextOverflow.ellipsis,
-                        ),
-                      ),
-                    ],
-                  ],
+                FittedBox(
+                  fit: BoxFit.scaleDown,
+                  alignment: Alignment.centerLeft,
+                  child: Text.rich(
+                    TextSpan(children: [
+                      TextSpan(text: issuer, style: const TextStyle(fontWeight: FontWeight.w700)),
+                      if (account.isNotEmpty)
+                        TextSpan(text: ' · $account', style: const TextStyle(fontWeight: FontWeight.w500)),
+                    ]),
+                    maxLines: 1,
+                    softWrap: false,
+                    style: const TextStyle(fontSize: 17, color: ZtIamColors.textPrimary),
+                  ),
                 ),
                 const SizedBox(height: 6),
                 GestureDetector(
@@ -1321,13 +1579,17 @@ class _AccountTile extends StatelessWidget {
                       );
                     }
                   },
-                  child: Text(
-                    _formatCode(code),
-                    style: const TextStyle(
-                      fontSize: 28,
-                      letterSpacing: 2.2,
-                      color: ZtIamColors.accentSoft,
-                      fontWeight: FontWeight.w600,
+                  child: FittedBox(
+                    fit: BoxFit.scaleDown,
+                    alignment: Alignment.centerLeft,
+                    child: Text(
+                      _formatCode(code),
+                      style: const TextStyle(
+                        fontSize: 34,
+                        letterSpacing: 1.6,
+                        color: ZtIamColors.accentSoft,
+                        fontWeight: FontWeight.w800,
+                      ),
                     ),
                   ),
                 ),
@@ -1360,10 +1622,10 @@ class _ProgressRing extends StatelessWidget {
         children: [
           ShaderMask(
             shaderCallback: (rect) {
-              return SweepGradient(
+              return const SweepGradient(
                 startAngle: -math.pi / 2,
                 endAngle: math.pi * 1.5,
-                colors: const [
+                colors: [
                   ZtIamColors.accentBlue,
                   ZtIamColors.accentSoftMuted,
                 ],
@@ -1373,7 +1635,7 @@ class _ProgressRing extends StatelessWidget {
               value: progress,
               strokeWidth: 4,
               backgroundColor: ZtIamColors.divider,
-              valueColor: const AlwaysStoppedAnimation<Color>(Colors.white),
+              valueColor: const AlwaysStoppedAnimation<Color>(ZtIamColors.accentGreen),
               strokeCap: StrokeCap.round,
             ),
           ),
@@ -1396,20 +1658,20 @@ class _EmptyState extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return Padding(
-      padding: const EdgeInsets.symmetric(vertical: 32),
+    return const Padding(
+      padding: EdgeInsets.symmetric(vertical: 32),
       child: Column(
-        children: const [
-          Icon(Icons.lock_outline, size: 48, color: Colors.white54),
+        children: [
+          Icon(Icons.lock_outline, size: 48, color: ZtIamColors.textMuted),
           SizedBox(height: 12),
           Text(
             'No accounts yet',
-            style: TextStyle(color: Colors.white70, fontSize: 16),
+            style: TextStyle(color: ZtIamColors.textSecondary, fontSize: 16),
           ),
           SizedBox(height: 4),
           Text(
             'Add an account using TOTP setup.',
-            style: TextStyle(color: Colors.white54),
+            style: TextStyle(color: ZtIamColors.textMuted),
             textAlign: TextAlign.center,
           ),
         ],
@@ -1443,7 +1705,7 @@ class _AppDrawer extends StatelessWidget {
           children: [
             const Text(
               'ZT-Authenticator',
-              style: TextStyle(fontSize: 20, color: Colors.white),
+              style: TextStyle(fontSize: 20, color: ZtIamColors.textPrimary),
             ),
             const SizedBox(height: 24),
             _DrawerItem(
@@ -1493,8 +1755,8 @@ class _DrawerItem extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return ListTile(
-      leading: Icon(icon, color: Colors.white70),
-      title: Text(label, style: const TextStyle(color: Colors.white70)),
+      leading: Icon(icon, color: ZtIamColors.textSecondary),
+      title: Text(label, style: const TextStyle(color: ZtIamColors.textSecondary)),
       onTap: () {
         Navigator.of(context).pop();
         onTap?.call();
@@ -1533,8 +1795,8 @@ class _SheetAction extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return ListTile(
-      leading: Icon(icon, color: Colors.white70),
-      title: Text(label, style: const TextStyle(color: Colors.white)),
+      leading: Icon(icon, color: ZtIamColors.textSecondary),
+      title: Text(label, style: const TextStyle(color: ZtIamColors.textPrimary)),
       onTap: onTap,
     );
   }
@@ -1700,22 +1962,88 @@ class _TotpSetupScreenState extends State<TotpSetupScreen> {
   }
 
   String _resolveApiBaseUrl(Map<String, dynamic> payload) {
+    final candidates = _resolveApiBaseUrls(payload);
+    if (candidates.isNotEmpty) {
+      return candidates.first;
+    }
+    return '';
+  }
+
+  List<String> _resolveApiBaseUrls(Map<String, dynamic> payload) {
+    final candidates = <String>[];
+    void addCandidate(String? raw) {
+      final value = raw?.trim() ?? '';
+      if (value.isEmpty) {
+        return;
+      }
+      final cleaned = _stripWhitespace(value);
+      final normalized =
+          cleaned.startsWith('http://') || cleaned.startsWith('https://')
+              ? _normalizeBaseUrl(cleaned)
+              : _normalizeBaseUrl('${_defaultScheme(cleaned)}://$cleaned');
+      if (normalized.isNotEmpty && !candidates.contains(normalized)) {
+        candidates.add(normalized);
+      }
+    }
+
     final rawBase = (payload['api_base_url'] as String?)?.trim() ??
         (payload['base_url'] as String?)?.trim() ??
         (payload['enroll_url'] as String?)?.trim() ??
         '';
     if (rawBase.isNotEmpty) {
-      final cleaned = _stripWhitespace(rawBase);
-      if (cleaned.startsWith('http://') || cleaned.startsWith('https://')) {
-        return _normalizeBaseUrl(cleaned);
+      addCandidate(rawBase);
+    }
+
+    final rawCandidates = payload['api_base_urls'];
+    if (rawCandidates is List) {
+      for (final candidate in rawCandidates) {
+        addCandidate(candidate?.toString());
       }
-      return _normalizeBaseUrl('${_defaultScheme(cleaned)}://$cleaned');
     }
+
     final rpId = (payload['rp_id'] as String?)?.trim() ?? '';
-    if (rpId.isEmpty) {
-      return '';
+    if (candidates.isEmpty && rpId.isNotEmpty) {
+      addCandidate('$rpId/api/auth');
     }
-    return _normalizeBaseUrl('${_defaultScheme(rpId)}://$rpId/api/auth');
+    return candidates;
+  }
+
+  bool _hasExplicitEnrollmentBaseUrl(Map<String, dynamic> payload) {
+    return ((payload['api_base_url'] as String?)?.trim().isNotEmpty ?? false) ||
+        ((payload['base_url'] as String?)?.trim().isNotEmpty ?? false) ||
+        ((payload['enroll_url'] as String?)?.trim().isNotEmpty ?? false) ||
+        (payload['api_base_urls'] is List &&
+            (payload['api_base_urls'] as List).isNotEmpty);
+  }
+
+  bool _sameEnrollmentTarget(
+    Map<String, dynamic> current,
+    Map<String, dynamic> next,
+  ) {
+    final currentBaseUrls = _resolveApiBaseUrls(current).join('|');
+    final nextBaseUrls = _resolveApiBaseUrls(next).join('|');
+    return currentBaseUrls == nextBaseUrls &&
+        ((current['rp_id'] as String?)?.trim() ?? '') ==
+            ((next['rp_id'] as String?)?.trim() ?? '') &&
+        ((current['email'] as String?)?.trim() ?? '') ==
+            ((next['email'] as String?)?.trim() ?? '') &&
+        ((current['enroll_token'] as String?)?.trim() ?? '') ==
+            ((next['enroll_token'] as String?)?.trim() ?? '');
+  }
+
+  Future<void> _replaceStalePendingEnrollment(
+    Map<String, dynamic> payload,
+  ) async {
+    final pending = _pendingPayload;
+    if (pending == null || _sameEnrollmentTarget(pending, payload)) {
+      return;
+    }
+    await _settings.clearPendingEnrollment();
+    if (mounted) {
+      setState(() {
+        _pendingPayload = null;
+      });
+    }
   }
 
   String _defaultScheme(String host) {
@@ -1942,6 +2270,7 @@ class _TotpSetupScreenState extends State<TotpSetupScreen> {
       }
       return;
     }
+    await _replaceStalePendingEnrollment(payload);
     final email = (payload['email'] as String?)?.trim() ?? '';
     final rpId = (payload['rp_id'] as String?)?.trim() ?? '';
     final rpDisplayName =
@@ -1998,13 +2327,34 @@ class _TotpSetupScreenState extends State<TotpSetupScreen> {
         candidateBaseUrls.add(normalized);
       }
 
-      addCandidate(detectedBaseUrl);
-      addCandidate(_rpBaseUrls[rpId] ?? '');
-      addCandidate(widget.fallbackBaseUrl.trim());
+      for (final baseUrl in _resolveApiBaseUrls(payload)) {
+        addCandidate(baseUrl);
+      }
+      if (!_hasExplicitEnrollmentBaseUrl(payload)) {
+        addCandidate(_rpBaseUrls[rpId] ?? '');
+        addCandidate(widget.fallbackBaseUrl.trim());
+      }
 
       if (candidateBaseUrls.isEmpty) {
         setState(() {
           _status = 'Enrollment needs a valid server URL.';
+        });
+        return;
+      }
+      final confirmedTarget = await _confirmEnrollmentTarget(
+        rpDisplayName: rpDisplayName,
+        rpId: rpId,
+        issuer: issuer,
+        accountName: accountName,
+        email: email,
+        candidateBaseUrls: candidateBaseUrls,
+      );
+      if (!mounted) {
+        return;
+      }
+      if (!confirmedTarget) {
+        setState(() {
+          _status = 'Enrollment cancelled.';
         });
         return;
       }
@@ -2121,6 +2471,9 @@ class _TotpSetupScreenState extends State<TotpSetupScreen> {
           setState(() {
             _pendingPayload = null;
           });
+          if (_recoveryCodes.isNotEmpty && mounted) {
+            await _showRecoveryCodesDialog();
+          }
           return;
         } catch (error) {
           lastError = 'Error: $error';
@@ -2152,6 +2505,152 @@ class _TotpSetupScreenState extends State<TotpSetupScreen> {
         });
       }
     }
+  }
+
+  Future<bool> _confirmEnrollmentTarget({
+    required String rpDisplayName,
+    required String rpId,
+    required String issuer,
+    required String accountName,
+    required String email,
+    required List<String> candidateBaseUrls,
+  }) async {
+    final hosts = candidateBaseUrls
+        .map((url) => Uri.tryParse(url)?.host ?? url)
+        .toSet()
+        .join(', ');
+    Widget row(String label, String value) => Padding(
+          padding: const EdgeInsets.symmetric(vertical: 2),
+          child: Text('$label: $value'),
+        );
+    final confirmed = await showDialog<bool>(
+      context: context,
+      barrierDismissible: false,
+      builder: (dialogContext) {
+        return AlertDialog(
+          backgroundColor: ZtIamColors.surface,
+          title: const Text('Confirm enrollment'),
+          content: SingleChildScrollView(
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                const Text(
+                  'A QR code or enrollment link can be created by anyone. '
+                  'Only continue if you recognize the server below as your '
+                  'own bank or organization.',
+                ),
+                const SizedBox(height: 12),
+                row('Organization', rpDisplayName),
+                row('Relying party ID', rpId),
+                row('Issuer', issuer),
+                row('Account', accountName),
+                row('Email', email),
+                row('Server', hosts.isEmpty ? 'unknown' : hosts),
+              ],
+            ),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.of(dialogContext).pop(false),
+              child: const Text('Cancel'),
+            ),
+            TextButton(
+              onPressed: () => Navigator.of(dialogContext).pop(true),
+              child: const Text('Enroll'),
+            ),
+          ],
+        );
+      },
+    );
+    return confirmed ?? false;
+  }
+
+  Future<void> _showRecoveryCodesDialog() async {
+    final codes = List<String>.from(_recoveryCodes);
+    var acknowledged = false;
+    await showDialog<void>(
+      context: context,
+      barrierDismissible: false,
+      builder: (dialogContext) {
+        return StatefulBuilder(
+          builder: (dialogContext, setDialogState) {
+            return AlertDialog(
+              backgroundColor: ZtIamColors.surface,
+              title: const Text('Save your recovery codes'),
+              content: SizedBox(
+                width: double.maxFinite,
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    const Text(
+                      'These codes are shown once. Store them somewhere safe '
+                      '— you will need one if you lose this device.',
+                    ),
+                    const SizedBox(height: 12),
+                    Container(
+                      padding: const EdgeInsets.all(12),
+                      decoration: BoxDecoration(
+                        color: ZtIamColors.input,
+                        borderRadius: BorderRadius.circular(8),
+                        border: Border.all(color: ZtIamColors.inputBorder),
+                      ),
+                      child: SelectableText(
+                        codes.join('\n'),
+                        style: const TextStyle(
+                          fontFamily: 'monospace',
+                          color: ZtIamColors.textPrimary,
+                        ),
+                      ),
+                    ),
+                    const SizedBox(height: 12),
+                    Row(
+                      children: [
+                        Checkbox(
+                          value: acknowledged,
+                          onChanged: (value) {
+                            setDialogState(() {
+                              acknowledged = value ?? false;
+                            });
+                          },
+                        ),
+                        const Expanded(
+                          child: Text("I've saved these recovery codes."),
+                        ),
+                      ],
+                    ),
+                  ],
+                ),
+              ),
+              actions: [
+                TextButton(
+                  onPressed: () async {
+                    await Clipboard.setData(
+                      ClipboardData(text: codes.join('\n')),
+                    );
+                    if (dialogContext.mounted) {
+                      ScaffoldMessenger.of(dialogContext).showSnackBar(
+                        const SnackBar(
+                          content: Text('Recovery codes copied.'),
+                        ),
+                      );
+                    }
+                  },
+                  child: const Text('Copy all'),
+                ),
+                TextButton(
+                  onPressed: acknowledged
+                      ? () => Navigator.of(dialogContext).pop()
+                      : null,
+                  child: const Text('Done'),
+                ),
+              ],
+            );
+          },
+        );
+      },
+    );
   }
 
   @override
@@ -2225,13 +2724,13 @@ class _TotpSetupScreenState extends State<TotpSetupScreen> {
             const SizedBox(height: 8),
             Text(
               'API: $_detectedBaseUrl',
-              style: const TextStyle(color: Colors.white70),
+              style: const TextStyle(color: ZtIamColors.textSecondary),
             ),
             if (_connectivityHint.isNotEmpty) ...[
               const SizedBox(height: 4),
               Text(
                 _connectivityHint,
-                style: const TextStyle(color: Colors.white54),
+                style: const TextStyle(color: ZtIamColors.textMuted),
               ),
             ],
           ],
@@ -2257,7 +2756,7 @@ class _TotpSetupScreenState extends State<TotpSetupScreen> {
           const SizedBox(height: 4),
           const Text(
             'Manual base32 setup is local-only and will show as Local.',
-            style: TextStyle(color: Colors.white54),
+            style: TextStyle(color: ZtIamColors.textMuted),
           ),
           const SizedBox(height: 12),
           if (_lastUserId.isNotEmpty || _lastDeviceId.isNotEmpty) ...[
@@ -2267,21 +2766,21 @@ class _TotpSetupScreenState extends State<TotpSetupScreen> {
             ),
             const SizedBox(height: 8),
             Text('Email: $_lastEmail',
-                style: const TextStyle(color: Colors.white70)),
+                style: const TextStyle(color: ZtIamColors.textSecondary)),
             Text('RP ID: $_lastRpId',
-                style: const TextStyle(color: Colors.white70)),
+                style: const TextStyle(color: ZtIamColors.textSecondary)),
             Text('Account: $_lastAccount',
-                style: const TextStyle(color: Colors.white70)),
+                style: const TextStyle(color: ZtIamColors.textSecondary)),
             Text('Issuer: $_lastIssuer',
-                style: const TextStyle(color: Colors.white70)),
+                style: const TextStyle(color: ZtIamColors.textSecondary)),
             Text('User ID: $_lastUserId',
-                style: const TextStyle(color: Colors.white70)),
+                style: const TextStyle(color: ZtIamColors.textSecondary)),
             Text('Device ID: $_lastDeviceId',
-                style: const TextStyle(color: Colors.white70)),
+                style: const TextStyle(color: ZtIamColors.textSecondary)),
             const SizedBox(height: 12),
           ],
           const SizedBox(height: 12),
-          Text(_status, style: const TextStyle(color: Colors.white70)),
+          Text(_status, style: const TextStyle(color: ZtIamColors.textSecondary)),
         ],
       ),
     );
@@ -2439,7 +2938,11 @@ class _LoginApprovalsScreenState extends State<LoginApprovalsScreen> {
           .map(
             (account) => _accountGet(
               account,
-              '/login/pending?user_id=${account.userId}',
+              '/login/pending?${Uri(queryParameters: {
+                    'user_id': account.userId,
+                    'device_id': account.deviceId,
+                    'rp_id': account.rpId,
+                  }).query}',
             ).timeout(const Duration(seconds: 2), onTimeout: () => null),
           )
           .toList(growable: false);
@@ -2550,7 +3053,11 @@ class _LoginApprovalsScreenState extends State<LoginApprovalsScreen> {
       return;
     }
     final loginId = pending['login_id'] as String? ?? '';
-    if (loginId.isEmpty) {
+    final nonce = pending['nonce'] as String? ?? '';
+    final pendingRp = (pending['rp_id'] as String? ?? account.rpId).trim();
+    final pendingDevice =
+        (pending['device_id'] as String? ?? account.deviceId).trim();
+    if (loginId.isEmpty || nonce.isEmpty) {
       return;
     }
     setState(() {
@@ -2558,8 +3065,19 @@ class _LoginApprovalsScreenState extends State<LoginApprovalsScreen> {
       _status = '';
     });
     try {
+      final signature = await widget.deviceCrypto.sign(
+        rpId: pendingRp,
+        nonce: nonce,
+        deviceId: pendingDevice,
+        otp: 'login-deny:$loginId',
+        keyId: account.keyId.isEmpty ? account.rpId : account.keyId,
+      );
       final response = await _accountPost(account, '/login/deny', {
         'login_id': loginId,
+        'device_id': pendingDevice,
+        'rp_id': pendingRp,
+        'nonce': nonce,
+        'signature': signature,
         'reason': 'user_denied',
       });
       setState(() {
@@ -2593,8 +3111,31 @@ class _LoginApprovalsScreenState extends State<LoginApprovalsScreen> {
         });
         return;
       }
+      final loginId = pending?['login_id'] as String? ?? '';
+      final nonce = pending?['nonce'] as String? ?? '';
+      final pendingRp = (pending?['rp_id'] as String? ?? account.rpId).trim();
+      final pendingDevice =
+          (pending?['device_id'] as String? ?? account.deviceId).trim();
+      if (loginId.isEmpty || nonce.isEmpty) {
+        setState(() {
+          _status = 'Pending login is missing data.';
+        });
+        return;
+      }
+      final signature = await widget.deviceCrypto.sign(
+        rpId: pendingRp,
+        nonce: nonce,
+        deviceId: pendingDevice,
+        otp: 'login-clear:${account.userId}',
+        keyId: account.keyId.isEmpty ? account.rpId : account.keyId,
+      );
       final response = await _accountPost(account, '/login/clear', {
         'user_id': account.userId,
+        'login_id': loginId,
+        'device_id': pendingDevice,
+        'rp_id': pendingRp,
+        'nonce': nonce,
+        'signature': signature,
       });
       await _refresh();
       setState(() {
@@ -2629,21 +3170,21 @@ class _LoginApprovalsScreenState extends State<LoginApprovalsScreen> {
           ),
           const SizedBox(height: 16),
           if (pending == null)
-            Text(_status, style: const TextStyle(color: Colors.white70)),
+            Text(_status, style: const TextStyle(color: ZtIamColors.textSecondary)),
           if (pending != null) ...[
             Text('Login ID: ${pending['login_id']}',
-                style: const TextStyle(color: Colors.white70)),
+                style: const TextStyle(color: ZtIamColors.textSecondary)),
             Text('RP ID: ${pending['rp_id']}',
-                style: const TextStyle(color: Colors.white70)),
+                style: const TextStyle(color: ZtIamColors.textSecondary)),
             Text('Device ID: ${pending['device_id']}',
-                style: const TextStyle(color: Colors.white70)),
+                style: const TextStyle(color: ZtIamColors.textSecondary)),
             const SizedBox(height: 16),
             Row(
               children: [
                 Expanded(
                   child: ElevatedButton(
                     style: ElevatedButton.styleFrom(
-                      backgroundColor: Colors.redAccent,
+                      backgroundColor: ZtIamColors.danger,
                       foregroundColor: Colors.white,
                     ),
                     onPressed: _loading ? null : _deny,
@@ -2664,7 +3205,7 @@ class _LoginApprovalsScreenState extends State<LoginApprovalsScreen> {
               ],
             ),
             const SizedBox(height: 12),
-            Text(_status, style: const TextStyle(color: Colors.white70)),
+            Text(_status, style: const TextStyle(color: ZtIamColors.textSecondary)),
           ],
           const SizedBox(height: 16),
           Row(
@@ -2683,7 +3224,7 @@ class _LoginApprovalsScreenState extends State<LoginApprovalsScreen> {
                 child: ElevatedButton(
                   style: ElevatedButton.styleFrom(
                     backgroundColor: ZtIamColors.card,
-                    foregroundColor: Colors.white,
+                    foregroundColor: ZtIamColors.textPrimary,
                     minimumSize: const Size.fromHeight(44),
                   ),
                   onPressed: _loading ? null : _clearPending,
@@ -2719,12 +3260,12 @@ class _SectionHeader extends StatelessWidget {
       children: [
         Text(
           title,
-          style: const TextStyle(fontSize: 18, color: Colors.white),
+          style: const TextStyle(fontSize: 18, color: ZtIamColors.textPrimary),
         ),
         const SizedBox(height: 4),
         Text(
           subtitle,
-          style: const TextStyle(color: Colors.white60),
+          style: const TextStyle(color: ZtIamColors.textSecondary),
         ),
       ],
     );

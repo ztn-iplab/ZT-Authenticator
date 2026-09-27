@@ -26,3 +26,17 @@ artifacts/local-builds/
 artifacts/private-signing/
 backend/certs/
 *.log
+
+# Build output
+**/build/
+mobile/android/app/release/
+mobile/android/app/debug/
+
+# Local working copies kept outside the released tree
+migration_backup/
+
+# Local signing material. Release signing keys never belong in the repository.
+artifacts/private-signing/
+**/key.properties
+*.jks
+*.keystore

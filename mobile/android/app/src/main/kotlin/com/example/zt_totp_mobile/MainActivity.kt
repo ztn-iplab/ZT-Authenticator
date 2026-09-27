@@ -1,5 +1,7 @@
 package com.example.zt_totp_mobile
 
+import android.content.Context
+import android.net.ConnectivityManager
 import android.security.keystore.KeyGenParameterSpec
 import android.security.keystore.KeyProperties
 import android.util.Base64
@@ -11,9 +13,19 @@ import java.security.KeyPairGenerator
 import java.security.KeyStore
 import java.security.Signature
 import java.security.spec.ECGenParameterSpec
+import java.net.Inet4Address
+import java.time.Duration
+import java.util.concurrent.Executors
+import org.xbill.DNS.ARecord
+import org.xbill.DNS.Lookup
+import org.xbill.DNS.Name
+import org.xbill.DNS.SimpleResolver
+import org.xbill.DNS.Type
 
 class MainActivity : FlutterActivity() {
     private val channelName = "zt_device_crypto"
+    private val networkChannelName = "zt_network_resolver"
+    private val networkExecutor = Executors.newSingleThreadExecutor()
 
     override fun configureFlutterEngine(@NonNull flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
@@ -54,6 +66,69 @@ class MainActivity : FlutterActivity() {
                     else -> result.notImplemented()
                 }
             }
+
+        MethodChannel(flutterEngine.dartExecutor.binaryMessenger, networkChannelName)
+            .setMethodCallHandler { call, methodResult ->
+                when (call.method) {
+                    "resolveHost" -> {
+                        val host = call.argument<String>("host")?.trim().orEmpty()
+                        if (host.isBlank()) {
+                            methodResult.error("bad_args", "host is required", null)
+                            return@setMethodCallHandler
+                        }
+                        networkExecutor.execute {
+                            try {
+                                val addresses = resolveViaActiveIpv4Dns(host)
+                                runOnUiThread { methodResult.success(addresses) }
+                            } catch (error: Exception) {
+                                runOnUiThread {
+                                    methodResult.error("dns_failed", error.toString(), null)
+                                }
+                            }
+                        }
+                    }
+                    else -> methodResult.notImplemented()
+                }
+            }
+    }
+
+    private fun resolveViaActiveIpv4Dns(host: String): List<String> {
+        val connectivity =
+            getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+        val network = connectivity.activeNetwork
+            ?: throw IllegalStateException("No active Android network")
+        val dnsServers = connectivity.getLinkProperties(network)?.dnsServers
+            ?.filterIsInstance<Inet4Address>()
+            .orEmpty()
+        if (dnsServers.isEmpty()) {
+            throw IllegalStateException("The active network has no IPv4 DNS server")
+        }
+
+        val absoluteName = Name.fromString("${host.trimEnd('.')}.")
+        for (server in dnsServers) {
+            try {
+                val resolver = SimpleResolver(server.hostAddress)
+                resolver.setTimeout(Duration.ofMillis(1200))
+                val lookup = Lookup(absoluteName, Type.A)
+                lookup.setResolver(resolver)
+                val addresses = lookup.run()
+                    ?.filterIsInstance<ARecord>()
+                    ?.mapNotNull { it.address.hostAddress }
+                    ?.distinct()
+                    .orEmpty()
+                if (addresses.isNotEmpty()) {
+                    return addresses
+                }
+            } catch (_: Exception) {
+                continue
+            }
+        }
+        throw IllegalStateException("No IPv4 DNS server resolved $host")
+    }
+
+    override fun onDestroy() {
+        networkExecutor.shutdownNow()
+        super.onDestroy()
     }
 
     private fun aliasForKey(rpId: String, keyId: String): String {

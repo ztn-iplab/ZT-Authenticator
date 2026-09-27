@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import 'package:flutter/foundation.dart';
 
 import 'app_settings.dart';
 import 'zt_theme.dart';
@@ -94,20 +95,22 @@ class _SettingsScreenState extends State<SettingsScreen> {
                   const Text('Check for login approvals every few seconds.'),
               onChanged: (value) => setState(() => _loginPolling = value),
             ),
-            SwitchListTile(
-              value: _allowInsecureTls,
-              title: const Text('Allow self-signed TLS'),
-              subtitle: const Text('Use for local testing only.'),
-              onChanged: (value) => setState(() => _allowInsecureTls = value),
-            ),
-            SwitchListTile(
-              value: _allowHttpDev,
-              title: const Text('Allow HTTP for local testing'),
-              subtitle: const Text(
-                'Use HTTP only for local server names entered without a scheme.',
+            if (kDebugMode) ...[
+              SwitchListTile(
+                value: _allowInsecureTls,
+                title: const Text('Allow self-signed TLS'),
+                subtitle: const Text('Use for local testing only.'),
+                onChanged: (value) => setState(() => _allowInsecureTls = value),
               ),
-              onChanged: (value) => setState(() => _allowHttpDev = value),
-            ),
+              SwitchListTile(
+                value: _allowHttpDev,
+                title: const Text('Allow HTTP for local testing'),
+                subtitle: const Text(
+                  'Use HTTP only for local server names entered without a scheme.',
+                ),
+                onChanged: (value) => setState(() => _allowHttpDev = value),
+              ),
+            ],
             const SizedBox(height: 16),
             ElevatedButton(
               onPressed: _saving ? null : _save,

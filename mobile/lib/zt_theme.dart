@@ -2,38 +2,40 @@ import 'package:flutter/material.dart';
 import 'package:google_fonts/google_fonts.dart';
 
 class ZtIamColors {
-  static const Color background = Color(0xFF1C1C3A);
-  static const Color surface = Color(0xFF212141);
-  static const Color card = Color(0xFF2D2F4A);
-  static const Color input = Color(0xFF0D1117);
-  static const Color inputBorder = Color(0xFF30363D);
-  static const Color textPrimary = Color(0xFFFFFFFF);
-  static const Color textSecondary = Color(0xFFD1D1E0);
-  static const Color textMuted = Color(0xFF8B949E);
-  static const Color accentBlue = Color(0xFF2962FF);
-  static const Color accentBlueDark = Color(0xFF1B47CC);
-  static const Color accentGreen = Color(0xFF2E7D32);
-  static const Color accentGreenDark = Color(0xFF1B5E20);
-  static const Color accentSoft = Color(0xFFB3C7FF);
-  static const Color accentSoftMuted = Color(0xFF8FA3FF);
-  static const Color divider = Color(0xFF30363D);
+  // Palette of the PoIA prototype relying party (app/static/style.css):
+  // cream page, warm white panels, teal actions, near-black ink.
+  static const Color background = Color(0xFFF4EFE6); // --bg
+  static const Color surface = Color(0xFFFFFDF8); // sign-intent modal
+  static const Color card = Color(0xFFFBF6EE); // intent and amount panels
+  static const Color input = Color(0xFFFFFFFF); // --panel
+  static const Color inputBorder = Color(0xFFC6DCE0);
+  static const Color textPrimary = Color(0xFF000000);
+  static const Color textSecondary = Color(0xFF1E1A16); // --ink
+  static const Color textMuted = Color(0xFF1E1A16); // --ink, for readability
+  static const Color accentBlue = Color(0xFF0F5B6A); // --accent
+  static const Color accentBlueDark = Color(0xFF0A3F49); // --accent-dark
+  static const Color accentGreen = Color(0xFF20816C); // positive / recipient
+  static const Color accentGreenDark = Color(0xFF185C3D);
+  static const Color accentSoft = Color(0xFF0F5B6A);
+  static const Color accentSoftMuted = Color(0xFFC6DCE0);
+  static const Color divider = Color(0xFFE4D8C8); // --border
+  static const Color danger = Color(0xFFB83A3A); // --danger
 
   static const LinearGradient backgroundGradient = LinearGradient(
-    colors: [Color(0xFF1C1C3A), Color(0xFF212141)],
-    begin: Alignment.topLeft,
-    end: Alignment.bottomRight,
+    colors: [Color(0xFFFFF7ED), Color(0xFFF4EFE6)],
+    begin: Alignment.topCenter,
+    end: Alignment.bottomCenter,
   );
 }
 
 ThemeData ztIamTheme() {
-  final base = ThemeData.dark();
+  final base = ThemeData.light();
   return ThemeData(
-    brightness: Brightness.dark,
+    brightness: Brightness.light,
     scaffoldBackgroundColor: ZtIamColors.background,
-    colorScheme: const ColorScheme.dark(
+    colorScheme: const ColorScheme.light(
       primary: ZtIamColors.accentBlue,
       secondary: ZtIamColors.accentGreen,
-      background: ZtIamColors.background,
       surface: ZtIamColors.surface,
       onPrimary: Colors.white,
       onSecondary: Colors.white,
@@ -75,7 +77,7 @@ ThemeData ztIamTheme() {
     ),
     snackBarTheme: const SnackBarThemeData(
       backgroundColor: ZtIamColors.card,
-      contentTextStyle: TextStyle(color: Colors.white),
+      contentTextStyle: TextStyle(color: ZtIamColors.textPrimary),
     ),
     cardTheme: const CardThemeData(
       color: ZtIamColors.card,

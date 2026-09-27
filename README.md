@@ -1,6 +1,26 @@
 # ZT-Authenticator
 
-ZT-Authenticator is a research-oriented Zero Trust take on time-based one-time passwords (TOTP). It combines classic TOTP factors with device-bound and relying party(RP) cryptographic proofs, so login approvals require both the shared secret, possession of the enrolled device key and the RP.
+ZT-Authenticator is a research authenticator: a Zero Trust take on time-based
+one-time passwords (TOTP) that binds every approval to the enrolled device key
+and to the relying party, so an approval requires the shared secret, possession
+of the enrolled device, and the right relying party together.
+
+It is also the second signing backend evaluated in:
+
+> **Proof-of-Intent Authorization (PoIA): Referent-Stable, Commitment-Confined
+> Intent Integrity Across the Authorization Lifecycle**
+> Patrick Mutabazi, Festus Edward Ndalama, Yuzo Taenaka, and Youki Kadobayashi
+> Laboratory for Cyber Resilience, Nara Institute of Science and Technology (NAIST)
+
+Where WebAuthn renders the intent in a browser panel separate from the
+authenticator, ZT-Authenticator renders and signs the canonical intent on one
+device. The relying-party prototype, the symbolic models and the recorded
+measurements are at
+[ztn-iplab/PoIA-Prototype](https://github.com/ztn-iplab/PoIA-Prototype).
+
+> **This is a research prototype.** It exists to make the paper's claims
+> checkable and to explore the design, not to be deployed. It has not been
+> security-reviewed for production use.
 
 ## Repository structure
 - **backend/** – HTTPS API, enrollment, verification, and recovery flows. See the [backend README](backend/README.md) for setup, database initialization, and protocol details.
@@ -63,3 +83,22 @@ Run:
 - **Research notes and experiments:** [docs/EXPERIMENTS.md](docs/EXPERIMENTS.md)
 
 For questions about a specific area, start with the README in that folder, then return here for the big-picture context.
+
+## Licence
+
+Released under the MIT Licence. See [LICENSE](LICENSE).
+
+## Citing
+
+A `CITATION.cff` file is included. Please cite:
+
+> P. Mutabazi, F. E. Ndalama, Y. Taenaka, and Y. Kadobayashi,
+> "Proof-of-Intent Authorization (PoIA): Cryptographic Binding of Verified
+> Intent to Action Semantics," in *Proc. 2026 10th Int. Conf. Cryptography,
+> Security and Privacy (CSP)*, Sapporo, Japan, Apr. 2026.
+
+## What is not in this repository
+
+No signing keys, keystores, certificates or `.env` files are committed. The
+Android debug keystore and any release signing material stay local and are
+excluded by `.gitignore`; generate your own before building.

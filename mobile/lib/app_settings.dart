@@ -1,5 +1,6 @@
 import 'dart:convert';
 
+import 'package:flutter/foundation.dart' show kDebugMode;
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 
 class AppSettings {
@@ -40,6 +41,11 @@ class AppSettings {
   }
 
   Future<bool> loadAllowInsecureTls() async {
+    // kDebugMode, not `dart.vm.product`: the latter is false in profile
+    // builds too, which can end up on a real device outside a debug session.
+    if (!kDebugMode) {
+      return false;
+    }
     final value = await _storage.read(key: _allowInsecureKey);
     if (value == null) {
       return false;
@@ -48,10 +54,17 @@ class AppSettings {
   }
 
   Future<void> saveAllowInsecureTls(bool enabled) async {
+    if (!kDebugMode) {
+      await _storage.delete(key: _allowInsecureKey);
+      return;
+    }
     await _storage.write(key: _allowInsecureKey, value: enabled.toString());
   }
 
   Future<bool> loadAllowHttpDev() async {
+    if (!kDebugMode) {
+      return false;
+    }
     final value = await _storage.read(key: _allowHttpDevKey);
     if (value == null) {
       return false;
@@ -60,6 +73,10 @@ class AppSettings {
   }
 
   Future<void> saveAllowHttpDev(bool enabled) async {
+    if (!kDebugMode) {
+      await _storage.delete(key: _allowHttpDevKey);
+      return;
+    }
     await _storage.write(key: _allowHttpDevKey, value: enabled.toString());
   }
 
