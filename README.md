@@ -7,8 +7,7 @@ of the enrolled device, and the right relying party together.
 
 It is also the second signing backend evaluated in:
 
-> **Proof-of-Intent Authorization (PoIA): Referent-Stable, Commitment-Confined
-> Intent Integrity Across the Authorization Lifecycle**
+> **Proof-of-Intent Authorization (PoIA): Enforcing Intent Integrity from Commitment to Execution**
 > Patrick Mutabazi, Festus Edward Ndalama, Yuzo Taenaka, and Youki Kadobayashi
 > Laboratory for Cyber Resilience, Nara Institute of Science and Technology (NAIST)
 
